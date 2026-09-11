@@ -1,0 +1,22 @@
+services:
+  rkl-upstox:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Kolkata
+      DASHBOARD_HOST: 0.0.0.0
+      OPEN_BROWSER: OFF
+      DATABASE_PATH: /app/data/production.sqlite3
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

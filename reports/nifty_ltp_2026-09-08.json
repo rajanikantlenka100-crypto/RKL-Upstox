@@ -1,0 +1,8 @@
+{
+  "instrument": "NIFTY",
+  "instrument_key": "NSE_INDEX|Nifty 50",
+  "exchange": "NSE_INDEX",
+  "ltp": 23635.1,
+  "retrieved_at": "2026-09-08T17:00:08.296136+05:30",
+  "source": "UPSTOX_REST"
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=RKL Upstox market data and guarded execution service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rkl
+Group=rkl
+WorkingDirectory=/opt/rkl-upstox/current
+EnvironmentFile=/etc/rkl-upstox/rkl-upstox.env
+ExecStart=/opt/rkl-upstox/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/rkl-upstox /var/log/rkl-upstox
+
+[Install]
+WantedBy=multi-user.target
