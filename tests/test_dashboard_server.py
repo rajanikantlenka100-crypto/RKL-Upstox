@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 import time
 import unittest
@@ -47,10 +48,13 @@ class FakeState:
 class DashboardServerTests(unittest.TestCase):
     def test_dashboard_health_endpoint(self):
         state = FakeState()
-        server = DashboardServer(state, "127.0.0.1", 8765)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = DashboardServer(state, "127.0.0.1", port)
         try:
             server.start(open_browser=False)
-            with urlopen("http://127.0.0.1:8765/health", timeout=2) as response:
+            with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             self.assertEqual(payload["status"], "ok")
             self.assertEqual(payload["components"]["DATABASE"], "READY")

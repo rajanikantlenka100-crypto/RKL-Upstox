@@ -39,6 +39,55 @@ class ExecutionModeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "UPSTOX_ORDER_IP"):
                     __import__("config").validate_runtime()
 
+    def test_production_mode_allows_real_orders_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "production.sqlite3"
+            with patch("config.EXECUTION_MODE", "PRODUCTION"), \
+                 patch("config.ENABLE_REAL_ORDERS", False), \
+                 patch("config.ORDER_ENV", "live"), \
+                 patch("config.AUTO_TRADING_ENABLED", True), \
+                 patch("config.AUTO_ENTRY_ENABLED", True), \
+                 patch("config.DATABASE_PATH", db_path):
+                __import__("config").validate_runtime()
+
+    def test_production_mode_rejects_sandbox_environment(self):
+        with patch("config.EXECUTION_MODE", "PRODUCTION"), \
+             patch("config.ENABLE_REAL_ORDERS", False), \
+             patch("config.ORDER_ENV", "sandbox"), \
+             patch("config.AUTO_TRADING_ENABLED", True), \
+             patch("config.AUTO_ENTRY_ENABLED", True):
+            with self.assertRaisesRegex(RuntimeError, "PRODUCTION requires ORDER_ENV=live"):
+                __import__("config").validate_runtime()
+
+    def test_read_only_mode_rejects_real_orders(self):
+        with patch("config.EXECUTION_MODE", "READ_ONLY"), \
+             patch("config.ENABLE_REAL_ORDERS", True), \
+             patch("config.ORDER_ENV", "live"), \
+             patch("config.ORDER_IP_WHITELIST", "192.0.2.1"):
+            with self.assertRaisesRegex(RuntimeError, "REAL_ORDERS_ENABLED=ON requires SANDBOX or PRODUCTION"):
+                __import__("config").validate_runtime()
+
+    def test_production_mode_uses_mode_specific_database_without_override(self):
+        with patch("config._DATABASE_OVERRIDE", ""), \
+             patch("config.EXECUTION_MODE", "PRODUCTION"):
+            config = __import__("config")
+            self.assertEqual(config._MODE_DATABASES["PRODUCTION"], config.ROOT / "data" / "production.sqlite3")
+
+    def test_legacy_database_override_is_rejected_outside_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = Path(directory) / "market_data.sqlite3"
+            with patch("config._DATABASE_OVERRIDE", str(legacy_path)), \
+                 patch("config.DATABASE_PATH", legacy_path), \
+                 patch("config.EXECUTION_MODE", "PRODUCTION"):
+                with self.assertRaisesRegex(RuntimeError, "Legacy shared database path"):
+                    __import__("config").validate_runtime()
+
+    def test_order_gate_remains_disabled_when_real_orders_are_off(self):
+        with patch("config.ENABLE_REAL_ORDERS", False), \
+             patch("config.EXECUTION_MODE", "PRODUCTION"), \
+             patch("config.PREFLIGHT_PASSED", True):
+            self.assertFalse(__import__("config").order_execution_enabled())
+
     def test_database_rejects_execution_mode_reuse(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mode.sqlite3"
