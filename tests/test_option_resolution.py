@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from instruments.options import (OptionContract, round_to_tick, select_atm_option,
+from instruments.options import (OptionContract, _expiry_date, round_to_tick, select_atm_option,
                                  validate_option_candle, validate_option_candle_identity)
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -35,6 +35,19 @@ class OptionResolutionTests(unittest.TestCase):
         contract = OptionContract("NIFTY", "08SEP2026", 23900, "CE", "NIFTY08SEP2623900CE", "42635", "NFO", 65, 0.05)
         self.assertEqual(contract["symbol"], contract.tradingsymbol)
         self.assertEqual(round_to_tick(131.63, contract.tick_size), 131.65)
+
+    def test_expiry_date_supports_iso_format(self):
+        self.assertEqual(_expiry_date("2026-10-27"), datetime(2026, 10, 27).date())
+
+    def test_expiry_date_supports_ddmonyyyy_format(self):
+        self.assertEqual(_expiry_date("27OCT2026"), datetime(2026, 10, 27).date())
+
+    def test_expiry_date_supports_epoch_milliseconds(self):
+        self.assertEqual(_expiry_date(1793125799000), datetime(2026, 10, 27).date())
+
+    def test_expiry_date_rejects_malformed_value(self):
+        with self.assertRaises(ValueError):
+            _expiry_date("not-an-expiry")
 
     def test_occupied_atm_contract_uses_deterministic_next_eligible_contract(self):
         records = [

@@ -72,6 +72,15 @@ def validate_option_candle(row, contract: OptionContract, *, timestamp, now=None
 
 def _expiry_date(value):
     try:
+        epoch_milliseconds = float(value)
+    except (TypeError, ValueError):
+        epoch_milliseconds = None
+    if epoch_milliseconds is not None:
+        try:
+            return datetime.fromtimestamp(epoch_milliseconds / 1000, tz=IST).date()
+        except (OverflowError, OSError, ValueError) as error:
+            raise ValueError(f"Invalid option expiry: {value!r}") from error
+    try:
         return datetime.strptime(str(value), "%Y-%m-%d").date()
     except ValueError:
         return datetime.strptime(str(value).upper(), "%d%b%Y").date()
