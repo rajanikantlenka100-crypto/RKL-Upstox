@@ -2,6 +2,8 @@ import json
 import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.request import urlopen
 
 from web_dashboard import DashboardServer
@@ -78,38 +80,32 @@ class DashboardServerTests(unittest.TestCase):
     def test_browser_open_attempt_uses_dashboard_url(self):
         state = FakeState()
         server = DashboardServer(state, "127.0.0.1", 8766)
-        opened = []
-        import webbrowser
-        original = webbrowser.open
-        webbrowser.open = lambda url: opened.append(url) or True
         try:
-            result = server.start(open_browser=True)
+            with patch("web_dashboard.os", SimpleNamespace(name="nt", environ={})), \
+                 patch("web_dashboard.webbrowser.open", return_value=True) as open_browser:
+                result = server.start(open_browser=True)
             self.assertEqual(result, "http://127.0.0.1:8766/")
-            self.assertEqual(opened, ["http://127.0.0.1:8766/"])
+            open_browser.assert_called_once_with("http://127.0.0.1:8766/")
         finally:
-            webbrowser.open = original
             server.stop()
 
     def test_browser_open_failure_does_not_crash_service(self):
         state = FakeState()
         server = DashboardServer(state, "127.0.0.1", 8767)
-        import webbrowser
-        original = webbrowser.open
-        webbrowser.open = lambda url: (_ for _ in ()).throw(OSError("blocked"))
         try:
-            result = server.start(open_browser=True)
+            with patch("web_dashboard.os", SimpleNamespace(name="nt", environ={})), \
+                 patch("web_dashboard.webbrowser.open", side_effect=OSError("blocked")):
+                result = server.start(open_browser=True)
             self.assertEqual(result, "http://127.0.0.1:8767/")
         finally:
-            webbrowser.open = original
             server.stop()
 
     def test_headless_start_does_not_attempt_browser_open(self):
         state = FakeState()
         server = DashboardServer(state, "127.0.0.1", 8769)
         import os
-        from unittest.mock import patch
         try:
-            with patch("web_dashboard.os.name", "posix"), \
+            with patch("web_dashboard.os", SimpleNamespace(name="posix", environ=os.environ)), \
                  patch.dict(os.environ, {}, clear=True), \
                  patch("web_dashboard.webbrowser.open") as open_browser:
                 result = server.start(open_browser=True)
