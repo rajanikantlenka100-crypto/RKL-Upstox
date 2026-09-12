@@ -163,8 +163,8 @@ def validate_runtime():
         raise RuntimeError("REAL_ORDERS_ENABLED=ON requires SANDBOX or PRODUCTION mode")
     if EXECUTION_MODE == "BACKTEST" and MARKET_DATA_MODE == "websocket":
         raise RuntimeError("BACKTEST mode cannot use live WebSocket market data")
-    if EXECUTION_MODE == "PRODUCTION" and (not ENABLE_REAL_ORDERS or ORDER_ENV != "live"):
-        raise RuntimeError("PRODUCTION requires REAL_ORDERS_ENABLED=ON and ORDER_ENV=live")
+    if EXECUTION_MODE == "PRODUCTION" and ORDER_ENV != "live":
+        raise RuntimeError("PRODUCTION requires ORDER_ENV=live")
     if EXECUTION_MODE == "PRODUCTION" and not AUTO_TRADING_ENABLED:
         raise RuntimeError("PRODUCTION requires AUTO_TRADING_ENABLED=ON")
     if EXECUTION_MODE == "SANDBOX" and (not ENABLE_REAL_ORDERS or ORDER_ENV != "sandbox"):
