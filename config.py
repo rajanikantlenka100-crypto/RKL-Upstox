@@ -187,6 +187,24 @@ def validate_runtime():
         raise RuntimeError("UPSTOX_ORDER_IP is invalid") from error
 
 
+def effective_auto_entry_enabled():
+    return AUTO_ENTRY_ENABLED and EXECUTION_MODE not in {"READ_ONLY", "BACKTEST"}
+
+
+def effective_auto_trading_enabled():
+    return AUTO_TRADING_ENABLED and EXECUTION_MODE not in {"READ_ONLY", "BACKTEST"}
+
+
+def execution_status_label():
+    if EXECUTION_MODE == "PRODUCTION" and ENABLE_REAL_ORDERS and ORDER_ENV == "live":
+        return "LIVE"
+    if EXECUTION_MODE == "SANDBOX" and ENABLE_REAL_ORDERS and ORDER_ENV == "sandbox":
+        return "SANDBOX"
+    if EXECUTION_MODE == "READ_ONLY":
+        return "READ_ONLY"
+    return EXECUTION_MODE
+
+
 def order_execution_enabled():
     return ENABLE_REAL_ORDERS and EXECUTION_MODE in {"SANDBOX", "PRODUCTION"} and PREFLIGHT_PASSED
 
@@ -201,6 +219,20 @@ def set_preflight_passed(value):
 
 def execution_mode_label():
     return EXECUTION_MODE
+
+
+def live_order_status():
+    if not ENABLE_REAL_ORDERS:
+        return "BLOCKED", "REAL_ORDERS_ENABLED=OFF"
+    if EXECUTION_MODE not in {"SANDBOX", "PRODUCTION"}:
+        return "BLOCKED", f"EXECUTION_MODE={EXECUTION_MODE}"
+    if ORDER_ENV != ("sandbox" if EXECUTION_MODE == "SANDBOX" else "live"):
+        return "BLOCKED", f"ORDER_ENV={ORDER_ENV}"
+    if not AUTO_TRADING_ENABLED:
+        return "BLOCKED", "AUTO_TRADING_ENABLED=OFF"
+    if not PREFLIGHT_PASSED:
+        return "BLOCKED", "PREFLIGHT_NOT_PASSED"
+    return "ENABLED", "READY"
 
 
 def portfolio_stream_enabled():

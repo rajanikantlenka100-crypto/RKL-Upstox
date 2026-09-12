@@ -44,8 +44,8 @@ class TerminalDisplay:
         self.reconnects = 0
         self.components = {
             "AUTH": "WAITING", "DATABASE": "READY", "HISTORY": "WAITING", "DATA FEED": "WAITING",
-            "AUTO ENTRY": "ENABLED" if config.AUTO_ENTRY_ENABLED else "DISABLED",
-            "EXECUTION MODE": "REAL" if config.ENABLE_REAL_ORDERS else "READ_ONLY",
+            "AUTO ENTRY": "ENABLED" if config.effective_auto_entry_enabled() else "DISABLED",
+            "EXECUTION MODE": "REAL" if config.order_execution_enabled() else "READ_ONLY",
             "PREFLIGHT": "WAITING",
             "CANDLES": "WAITING", "SIGNALS": "WAITING", "BROKER": "WAITING",
             "RISK": "READY", "ORDERS": "DISABLED", "EXTERNAL": "UNAVAILABLE",

@@ -16,11 +16,13 @@ class UpstoxSystemTests(unittest.TestCase):
         statuses = []
         adapter = UpstoxAdapter(lambda tick: None, statuses.append)
 
-        with patch("config.require_credentials"), patch.object(
+        with patch("config.require_credentials"), patch("config.UPSTOX_ACCESS_TOKEN", ""), patch.object(
             adapter, "on_status", statuses.append
-        ):
+        ), patch("broker.upstox.UpstoxClient.request", return_value={"access_token": "unit-test-token"}) as request:
             adapter.authenticate()
 
+        request.assert_called_once()
+        self.assertIn("/v2/login/authorization/token", request.call_args.args[1])
         self.assertEqual(statuses[-2:], ["ACCESS TOKEN PRESENT", "CREDENTIAL LOADED"])
         self.assertNotIn("AUTHENTICATED", statuses)
 

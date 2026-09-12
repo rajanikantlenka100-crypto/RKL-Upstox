@@ -121,16 +121,30 @@ class MarketDataService:
 
     def start(self):
         print("=" * 60 + "\nRKL ALGO TRADING\n" + "=" * 60, flush=True)
-        print(f"EXECUTION MODE: {config.execution_mode_label()}", flush=True)
+        print(f"EXECUTION MODE: {config.execution_status_label()}", flush=True)
         print(f"REAL ORDERS: {'ENABLED' if config.ENABLE_REAL_ORDERS else 'DISABLED'}", flush=True)
-        print(f"AUTO ENTRY: {'ENABLED' if config.AUTO_ENTRY_ENABLED else 'DISABLED'}", flush=True)
+        print(f"AUTO ENTRY: {'ENABLED' if config.effective_auto_entry_enabled() else 'DISABLED'}", flush=True)
+        print(f"ORDER ENVIRONMENT: {config.ORDER_ENV.upper()}", flush=True)
         try:
             config.validate_runtime()
         except RuntimeError as error:
             self._halt_trading(f"Startup configuration safety failure: {error}")
             return
-        print("[BOOT] CONFIG LOADED", flush=True)
+        print("[BOOT] CONFIG VALIDATED", flush=True)
         print("[BOOT] DATABASE READY", flush=True)
+
+        self.display.set_component("DATABASE", "READY")
+        self.display.set_component("DASHBOARD", "STARTING")
+        print("[BOOT] DASHBOARD START", flush=True)
+        try:
+            dashboard_url = self.dashboard.start(open_browser=config.OPEN_BROWSER)
+            self.dashboard_started = True
+            self.display.set_component("DASHBOARD", "READY")
+            print(f"[DASHBOARD] READY - {dashboard_url}", flush=True)
+        except RuntimeError as error:
+            self.display.set_component("DASHBOARD", "FAILED")
+            self._record_event("DASHBOARD_START_FAILURE", {"reason": str(error)})
+            print(f"[DASHBOARD] FAILED: {type(error).__name__}: {error}", flush=True)
 
         def startup_phase(name, action):
             if self.stop_event.is_set():
@@ -223,22 +237,6 @@ class MarketDataService:
             "DISABLED-READ_ONLY" if config.EXECUTION_MODE == "READ_ONLY" else "DISABLED-PREFLIGHT"
         )
         self.display.set_component("ORDERS", order_status)
-        self.display.set_component("DASHBOARD", "STARTING")
-        print("[BOOT] DASHBOARD START", flush=True)
-        print("[DASHBOARD] STARTING", flush=True)
-        try:
-            dashboard_url = self.dashboard.start(open_browser=config.OPEN_BROWSER)
-            self.dashboard_started = True
-        except RuntimeError as error:
-            self.display.set_component("DASHBOARD", "FAILED")
-            self._record_event("DASHBOARD_START_FAILURE", {"reason": str(error)})
-            print(f"[DASHBOARD] FAILED: {type(error).__name__}: {error}", flush=True)
-            dashboard_url = "dashboard unavailable"
-        else:
-            self.display.set_component("DASHBOARD", "READY")
-            print("[BOOT] DASHBOARD HEALTH CHECK PASS", flush=True)
-            print(f"[DASHBOARD] READY - {dashboard_url}", flush=True)
-
         print("[BOOT] CANDLE ENGINE START", flush=True)
         print("[BOOT] CANDLE ENGINE COMPLETE", flush=True)
         print("[BOOT] SIGNAL ENGINE START", flush=True)
@@ -258,17 +256,24 @@ class MarketDataService:
 
     def _authenticate_and_validate(self):
         print("[AUTH] STARTING UPSTOX AUTHENTICATION", flush=True)
+        print("[AUTH] CREDENTIALS_LOADED", flush=True)
+        self.display.set_component("AUTH", "AUTH_REQUEST_STARTED")
         try:
             self.adapter.authenticate()
         except RuntimeError as error:
             classification = "TOKEN_MISSING" if "Missing" in str(error) else "AUTHENTICATION ERROR"
+            self.display.set_component("AUTH", classification)
             raise AuthenticationStartupBlocked(classification) from error
-        print("[AUTH] TOKEN LOADED", flush=True)
+        print("[AUTH] TOKEN_LOADED", flush=True)
+        print("[AUTH] AUTH_REQUEST_STARTED", flush=True)
         print("[AUTH] VALIDATING TOKEN WITH UPSTOX...", flush=True)
         result = self.adapter.validate_token()
         if result != "TOKEN VALID":
             self.display.set_component("AUTH", result)
             raise AuthenticationStartupBlocked(result)
+        self.display.set_component("AUTH", "AUTHENTICATED")
+        print("[AUTH] TOKEN_VALIDATED", flush=True)
+        print("[AUTH] AUTHENTICATED", flush=True)
 
     def stop(self, *_):
         if not self.stop_event.is_set():
@@ -764,15 +769,26 @@ class MarketDataService:
         finally:
             self.recovery_lock.release()
 
-    def _backfill(self):
-        for instrument in self.instruments.values():
+    def _backfill_index(self, instrument):
+        total_started = time.monotonic()
+        fetch_elapsed = 0.0
+        parse_elapsed = 0.0
+        reconcile_elapsed = 0.0
+        replace_elapsed = 0.0
+        seed_elapsed = 0.0
+        try:
+            fetch_started = time.monotonic()
             try:
                 rows = self.adapter.fetch_historical(instrument, count=config.HISTORICAL_COUNT)
-                candles = []
-                mismatch = False
-                seen_timestamps = set()
-                previous_timestamp = None
-                for row in rows:
+            finally:
+                fetch_elapsed = time.monotonic() - fetch_started
+            candles = []
+            mismatch = False
+            seen_timestamps = set()
+            previous_timestamp = None
+            for row in rows:
+                parse_started = time.monotonic()
+                try:
                     timestamp, open_price, high, low, close, volume = parse_historical_row(row)
                     if timestamp in seen_timestamps:
                         raise ValueError(f"Duplicate historical candle timestamp {timestamp.isoformat()}")
@@ -780,61 +796,94 @@ class MarketDataService:
                         raise ValueError(f"Historical candle timestamps are not strictly chronological for {instrument.name}")
                     seen_timestamps.add(timestamp)
                     previous_timestamp = timestamp
-                    if timestamp + timedelta(minutes=config.TIMEFRAME_MINUTES) > datetime.now(IST):
-                        continue
-                    candle = Candle(instrument=instrument.name, exchange=instrument.exchange, token=instrument.token,
-                                    timestamp=timestamp, timeframe="5m", open=open_price, high=high,
-                                    low=low, close=close, volume=volume, source="HISTORICAL")
-                    reconciliation = self.store.reconcile(candle)
-                    if reconciliation == "MISMATCH":
-                        mismatch = True
-                        local = self.store.existing_ohlc(candle)
-                        self._record_event("BROKER_MISMATCH", {
-                            "instrument": instrument.name, "timestamp": timestamp.isoformat(),
-                            "rest_ohlc": [open_price, high, low, close, volume],
-                            "local_ohlc": list(local) if local else None,
-                        }, "reconciliation_events")
-                        self._on_status(f"RECONCILIATION MISMATCH {instrument.name} {timestamp.isoformat()} REST={open_price:.2f},{high:.2f},{low:.2f},{close:.2f} LOCAL={local[:4] if local else 'missing'}")
-                        self.store.replace(candle)
-                    candles.append(candle)
-                minimum_warmup = config.RSI_PERIOD + config.RSI_SMA_PERIOD + config.RSI_LOOKBACK_PERIODS
-                if len(candles) < minimum_warmup:
-                    raise ValueError(f"Insufficient historical warm-up for {instrument.name}: {len(candles)} < {minimum_warmup}")
-                self.engines[instrument.name].seed(candles)
-                running_row = self.store.latest_running(instrument.name)
-                if running_row:
-                    running = Candle(instrument=running_row[0], exchange=running_row[1], token=running_row[2],
-                                     timestamp=datetime.fromisoformat(running_row[3]), timeframe=running_row[5],
-                                     open=running_row[6], high=running_row[7], low=running_row[8],
-                                     close=running_row[9], volume=running_row[10], source=running_row[11], status="RUNNING")
-                    if running.timestamp.date() == datetime.now(IST).date() and running.timestamp >= (candles[-1].timestamp if candles else running.timestamp):
-                        self.engines[instrument.name].restore_running(running)
-                self.reconciliation_blocked.discard(instrument.name)
-                if config.INTRADAY_RECONCILIATION_ENABLED:
-                    self._reconcile_intraday(instrument, candles)
-                checked = datetime.now(IST).strftime("%H:%M:%S")
-                last_hist = candles[-1].timestamp.strftime("%H:%M") if candles else "--"
-                self.display.set_sync(instrument.name, status="SYNCED", last_hist=last_hist,
-                                      last_local=last_hist, gap=0, checked=checked)
-                self.display.set_rest_status(instrument.name, "SYNCED")
-                if candles:
-                    context = self.engines[instrument.name].context(instrument.name)
-                    self.display.set_candle_context(instrument.name, context["prev2"],
-                                                     context["previous"], context["running"])
-                    self.display.set_indicators(
-                        instrument.name,
-                        cci(candles, config.CCI_PERIOD),
-                        rsi(candles, config.RSI_PERIOD),
-                        candles[-1].timestamp,
-                    )
-                history_label = "history reconciled" if not mismatch else "history mismatches repaired"
-                self.display.add_event(f"{instrument.name} {history_label} ({len(candles)})")
-            except Exception as error:
-                self.display.set_rest_status(instrument.name, "FAILED")
-                self.display.set_sync(instrument.name, status="FAILED", reason=str(error),
-                                      last_hist="--", last_local="--", gap="--",
-                                      checked=datetime.now(IST).strftime("%H:%M:%S"))
-                self._on_status(f"REST SYNC FAILED {instrument.name}: {error}")
+                    finalized = timestamp + timedelta(minutes=config.TIMEFRAME_MINUTES) <= datetime.now(IST)
+                    if not finalized:
+                        candle = None
+                    else:
+                        candle = Candle(instrument=instrument.name, exchange=instrument.exchange, token=instrument.token,
+                                        timestamp=timestamp, timeframe="5m", open=open_price, high=high,
+                                        low=low, close=close, volume=volume, source="HISTORICAL")
+                finally:
+                    parse_elapsed += time.monotonic() - parse_started
+                if not finalized:
+                    continue
+                reconcile_started = time.monotonic()
+                reconciliation = self.store.reconcile(candle)
+                reconcile_elapsed += time.monotonic() - reconcile_started
+                if reconciliation == "MISMATCH":
+                    mismatch = True
+                    local = self.store.existing_ohlc(candle)
+                    self._record_event("BROKER_MISMATCH", {
+                        "instrument": instrument.name, "timestamp": timestamp.isoformat(),
+                        "rest_ohlc": [open_price, high, low, close, volume],
+                        "local_ohlc": list(local) if local else None,
+                    }, "reconciliation_events")
+                    self._on_status(f"RECONCILIATION MISMATCH {instrument.name} {timestamp.isoformat()} REST={open_price:.2f},{high:.2f},{low:.2f},{close:.2f} LOCAL={local[:4] if local else 'missing'}")
+                    replace_started = time.monotonic()
+                    self.store.replace(candle)
+                    replace_elapsed += time.monotonic() - replace_started
+                candles.append(candle)
+            minimum_warmup = config.RSI_PERIOD + config.RSI_SMA_PERIOD + config.RSI_LOOKBACK_PERIODS
+            if len(candles) < minimum_warmup:
+                raise ValueError(f"Insufficient historical warm-up for {instrument.name}: {len(candles)} < {minimum_warmup}")
+            seed_started = time.monotonic()
+            self.engines[instrument.name].seed(candles)
+            seed_elapsed = time.monotonic() - seed_started
+            running_row = self.store.latest_running(instrument.name)
+            if running_row:
+                running = Candle(instrument=running_row[0], exchange=running_row[1], token=running_row[2],
+                                 timestamp=datetime.fromisoformat(running_row[3]), timeframe=running_row[5],
+                                 open=running_row[6], high=running_row[7], low=running_row[8],
+                                 close=running_row[9], volume=running_row[10], source=running_row[11], status="RUNNING")
+                if running.timestamp.date() == datetime.now(IST).date() and running.timestamp >= (candles[-1].timestamp if candles else running.timestamp):
+                    self.engines[instrument.name].restore_running(running)
+            self.reconciliation_blocked.discard(instrument.name)
+            if config.INTRADAY_RECONCILIATION_ENABLED:
+                self._reconcile_intraday(instrument, candles)
+            checked = datetime.now(IST).strftime("%H:%M:%S")
+            last_hist = candles[-1].timestamp.strftime("%H:%M") if candles else "--"
+            self.display.set_sync(instrument.name, status="SYNCED", last_hist=last_hist,
+                                  last_local=last_hist, gap=0, checked=checked)
+            self.display.set_rest_status(instrument.name, "SYNCED")
+            if candles:
+                context = self.engines[instrument.name].context(instrument.name)
+                self.display.set_candle_context(instrument.name, context["prev2"],
+                                                 context["previous"], context["running"])
+                self.display.set_indicators(
+                    instrument.name,
+                    cci(candles, config.CCI_PERIOD),
+                    rsi(candles, config.RSI_PERIOD),
+                    candles[-1].timestamp,
+                )
+            history_label = "history reconciled" if not mismatch else "history mismatches repaired"
+            self.display.add_event(f"{instrument.name} {history_label} ({len(candles)})")
+            return {"instrument": instrument.name, "status": "SYNCED", "count": len(candles)}
+        except Exception as error:
+            self.display.set_rest_status(instrument.name, "FAILED")
+            self.display.set_sync(instrument.name, status="FAILED", reason=str(error),
+                                  last_hist="--", last_local="--", gap="--",
+                                  checked=datetime.now(IST).strftime("%H:%M:%S"))
+            self._on_status(f"REST SYNC FAILED {instrument.name}: {error}")
+            return {"instrument": instrument.name, "status": "FAILED", "error": str(error)}
+        finally:
+            total_elapsed = time.monotonic() - total_started
+            print(
+                f"[BACKFILL TIMING] {instrument.name} "
+                f"fetch={fetch_elapsed:.3f}s parse_validate={parse_elapsed:.3f}s "
+                f"reconcile={reconcile_elapsed:.3f}s replace={replace_elapsed:.3f}s "
+                f"seed={seed_elapsed:.3f}s total={total_elapsed:.3f}s",
+                flush=True,
+            )
+
+    def _backfill(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(4, max(1, len(self.instruments)))
+        futures = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for instrument in self.instruments.values():
+                futures[executor.submit(self._backfill_index, instrument)] = instrument.name
+            for future in as_completed(futures):
+                future.result()
         with self.display.lock:
             synced = all(self.display.rest_status.get(name) == "SYNCED" for name in self.instruments) and not self.reconciliation_blocked
         self.display.set_component("HISTORY", "READY" if synced else "DEGRADED")

@@ -55,6 +55,26 @@ class DashboardServerTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_dashboard_reports_degraded_but_available_while_startup_not_ready(self):
+        state = FakeState()
+        state.components = {"AUTH": "WAITING", "DATABASE": "READY", "HISTORY": "WAITING",
+                            "BROKER": "WAITING", "PREFLIGHT": "WAITING", "DASHBOARD": "READY"}
+        server = DashboardServer(state, "127.0.0.1", 8770)
+        try:
+            server.start(open_browser=False)
+            with urlopen("http://127.0.0.1:8770/health", timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(payload["status"], "degraded")
+            self.assertFalse(payload["ready"])
+            try:
+                with urlopen("http://127.0.0.1:8770/ready", timeout=2) as response:
+                    ready_payload = json.loads(response.read().decode("utf-8"))
+                    self.fail("/ready should report not ready during startup")
+            except Exception as error:
+                self.assertEqual(getattr(error, "code", None), 503)
+        finally:
+            server.stop()
+
     def test_browser_open_attempt_uses_dashboard_url(self):
         state = FakeState()
         server = DashboardServer(state, "127.0.0.1", 8766)
@@ -81,6 +101,21 @@ class DashboardServerTests(unittest.TestCase):
             self.assertEqual(result, "http://127.0.0.1:8767/")
         finally:
             webbrowser.open = original
+            server.stop()
+
+    def test_headless_start_does_not_attempt_browser_open(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8769)
+        import os
+        from unittest.mock import patch
+        try:
+            with patch("web_dashboard.os.name", "posix"), \
+                 patch.dict(os.environ, {}, clear=True), \
+                 patch("web_dashboard.webbrowser.open") as open_browser:
+                result = server.start(open_browser=True)
+            self.assertEqual(result, "http://127.0.0.1:8769/")
+            open_browser.assert_not_called()
+        finally:
             server.stop()
 
     def test_dashboard_html_includes_market_sections(self):
