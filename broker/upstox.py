@@ -6,6 +6,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
 from datetime import datetime, timedelta
 from typing import Callable
 from uuid import uuid4
@@ -19,12 +20,14 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 class UpstoxClient:
-    def __init__(self, access_token, api_base=None, order_base=None):
+    def __init__(self, access_token, api_base=None, order_base=None, telemetry=None):
         self.access_token = access_token
         self.api_base = (api_base or config.UPSTOX_API_BASE).rstrip("/")
         self.order_base = (order_base or config.UPSTOX_ORDER_BASE).rstrip("/")
+        self.telemetry = telemetry
 
     def request(self, method, url, payload=None, form=False, headers=None):
+        started = time.perf_counter()
         body = None
         request_headers = {"Accept": "application/json", "User-Agent": "RKL-Upstox/1.0"}
         if self.access_token:
@@ -41,10 +44,19 @@ class UpstoxClient:
         request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=config.UPSTOX_REQUEST_TIMEOUT_SECONDS) as response:
-                return json.loads(response.read().decode("utf-8"))
+                result = json.loads(response.read().decode("utf-8"))
+                if self.telemetry:
+                    self.telemetry("API_RESPONSE", {"method": method, "url": url, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "success": True})
+                return result
         except urllib.error.HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
+            if self.telemetry:
+                self.telemetry("API_ERROR", {"method": method, "url": url, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "error": str(error)})
             raise RuntimeError(f"Upstox HTTP {error.code}: {details[:500]}") from error
+        except Exception as error:
+            if self.telemetry:
+                self.telemetry("API_ERROR", {"method": method, "url": url, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "error": str(error)})
+            raise
 
     def place_order(self, params):
         payload = {
@@ -122,11 +134,12 @@ class UpstoxClient:
 
 
 class UpstoxAdapter:
-    def __init__(self, on_tick: Callable[[MarketTick], None], on_status: Callable[[str], None], on_raw_event=None, on_portfolio_event=None):
+    def __init__(self, on_tick: Callable[[MarketTick], None], on_status: Callable[[str], None], on_raw_event=None, on_portfolio_event=None, telemetry=None):
         self.on_tick = on_tick
         self.on_status = on_status
         self.on_raw_event = on_raw_event or (lambda event: None)
         self.on_portfolio_event = on_portfolio_event or (lambda event: None)
+        self.telemetry = telemetry
         self.client = None
         self.order_client = None
         self.instruments: dict[str, Instrument] = {}
@@ -146,7 +159,7 @@ class UpstoxAdapter:
         self.on_status("AUTHENTICATING")
         access_token = config.UPSTOX_ACCESS_TOKEN
         if not access_token:
-            response = UpstoxClient("").request("POST", f"{config.UPSTOX_API_BASE}/v2/login/authorization/token", {
+            response = UpstoxClient("", telemetry=self.telemetry).request("POST", f"{config.UPSTOX_API_BASE}/v2/login/authorization/token", {
                 "code": config.UPSTOX_AUTH_CODE, "client_id": config.UPSTOX_CLIENT_ID,
                 "client_secret": config.UPSTOX_CLIENT_SECRET, "redirect_uri": config.UPSTOX_REDIRECT_URI,
                 "grant_type": "authorization_code",
@@ -155,9 +168,9 @@ class UpstoxAdapter:
         if not access_token:
             self.on_status("AUTHENTICATION FAILED")
             raise RuntimeError("Upstox did not return an access_token")
-        self.client = UpstoxClient(access_token)
+        self.client = UpstoxClient(access_token, telemetry=self.telemetry)
         self.order_client = (
-            UpstoxClient(config.SANDBOX_ACCESS_TOKEN, config.SANDBOX_API_BASE, config.SANDBOX_API_BASE)
+            UpstoxClient(config.SANDBOX_ACCESS_TOKEN, config.SANDBOX_API_BASE, config.SANDBOX_API_BASE, telemetry=self.telemetry)
             if config.ORDER_ENV == "sandbox" else self.client
         )
         self.on_status("ACCESS TOKEN PRESENT")

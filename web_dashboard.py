@@ -1,5 +1,7 @@
 """Local read-only dashboard fed by the Python trading state."""
 
+import asyncio
+import hmac
 import json
 import os
 import threading
@@ -9,6 +11,12 @@ import webbrowser
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+try:
+  import websockets
+except ImportError:  # pragma: no cover - dependency is installed for mobile deployment
+  websockets = None
 
 HTML = """<!doctype html>
 <html lang="en">
@@ -368,15 +376,166 @@ def _json_value(value):
 
 
 class DashboardServer:
-    def __init__(self, state, host="127.0.0.1", port=8765):
+    def __init__(self, state, host="127.0.0.1", port=8765, *, mobile_token="", store=None,
+                 mobile_ws_host="127.0.0.1", mobile_ws_port=None):
         self.state = state
         self.host = host
         self.port = port
+        self.mobile_token = mobile_token
+        self.store = store
+        self.mobile_ws_host = mobile_ws_host
+        self.mobile_ws_port = mobile_ws_port or port + 1
         self.server = None
         self.thread = None
+        self.mobile_ws_server = None
+        self.mobile_ws_thread = None
+        self.mobile_ws_loop = None
+        self.mobile_ws_stop = None
+        self.mobile_ws_async_stop = None
         self._stop = threading.Event()
         self.browser_opened = False
         self.url = f"http://{self.host}:{self.port}/"
+
+    def _mobile_payload(self, path, query=None):
+        snapshot = self.state.snapshot()
+        query = query or {}
+        if path in {"/api/mobile/status", "/api/v1/mobile/status"}:
+          return {key: snapshot.get(key) for key in (
+            "components", "system_status", "ws_status", "startup_phase", "market_status",
+            "execution_mode", "preflight", "last_event", "reconnects",
+          )} | {"server_time": datetime.now().astimezone().isoformat()}
+        if path in {"/api/mobile/market", "/api/mobile/indices", "/api/v1/mobile/market"}:
+          return {key: snapshot.get(key) for key in (
+            "instrument_names", "latest", "candles", "previous", "prev2", "health", "sync",
+            "market_status",
+          )}
+        for prefix in ("/api/mobile/indices/", "/api/v1/mobile/indices/"):
+            if path.startswith(prefix):
+                index = path[len(prefix):].upper()
+                return {"index": index, "market": {
+                    key: (snapshot.get(key) or {}).get(index)
+                    for key in ("latest", "candles", "previous", "prev2", "health", "sync", "indicators")
+                }}
+        for prefix in ("/api/mobile/options/", "/api/v1/mobile/options/"):
+            if path.startswith(prefix):
+                index = path[len(prefix):].upper()
+                return {"index": index, "option_universe": {
+                    token: value for token, value in (snapshot.get("option_universe") or {}).items()
+                    if value.get("underlying", "").upper() == index
+                }, "option_quotes": snapshot.get("option_quotes", {}), "signal": snapshot.get("signal")}
+        if path in {"/api/mobile/options", "/api/v1/mobile/options"}:
+          return {key: snapshot.get(key) for key in ("option_universe", "option_quotes", "signal")}
+        if path in {"/api/mobile/signals", "/api/v1/mobile/signals"}:
+          return {key: snapshot.get(key) for key in ("signal", "signal_history", "signal_queue")}
+        for prefix in ("/api/mobile/signals/", "/api/v1/mobile/signals/"):
+            if path.startswith(prefix):
+                signal_id = path[len(prefix):]
+                signals = [item for item in snapshot.get("signal_history", []) if item.get("signal_id") == signal_id]
+                if snapshot.get("signal", {}).get("signal_id") == signal_id:
+                    signals.insert(0, snapshot["signal"])
+                return {"signal_id": signal_id, "signal": signals[0] if signals else None}
+        if path in {"/api/mobile/orders", "/api/v1/mobile/orders"}:
+          return {"orders": snapshot.get("orders", [])}
+        for prefix in ("/api/mobile/orders/", "/api/v1/mobile/orders/"):
+            if path.startswith(prefix):
+                order_id = path[len(prefix):]
+                order = next((item for item in snapshot.get("orders", [])
+                              if isinstance(item, dict) and str(item.get("order_id")) == order_id), None)
+                return {"order_id": order_id, "order": order}
+        if path in {"/api/mobile/positions", "/api/v1/mobile/positions"}:
+          return {"positions": snapshot.get("positions", []), "position_details": snapshot.get("position_details", [])}
+        for prefix in ("/api/mobile/positions/", "/api/v1/mobile/positions/"):
+            if path.startswith(prefix):
+                trade_id = path[len(prefix):]
+                position = next((item for item in snapshot.get("position_details", [])
+                                 if str(item.get("trade_id")) == trade_id), None)
+                return {"trade_id": trade_id, "position": position}
+        if path in {"/api/mobile/notifications", "/api/v1/mobile/notifications"}:
+          return {"events": snapshot.get("events", []), "severity": query.get("severity", [None])[0],
+                  "category": query.get("category", [None])[0]}
+        if path in {"/api/mobile/reports", "/api/v1/mobile/reports"}:
+          return {"reports": self.store.daily_reports() if self.store and hasattr(self.store, "daily_reports") else []}
+        for prefix in ("/api/mobile/reports/", "/api/v1/mobile/reports/"):
+            if path.startswith(prefix):
+                report_date = path[len(prefix):]
+                reports = self.store.daily_reports() if self.store and hasattr(self.store, "daily_reports") else []
+                return {"report_date": report_date, "report": next((item for item in reports if item.get("report_date") == report_date), None)}
+        if path in {"/api/mobile/sandbox", "/api/v1/mobile/sandbox"}:
+          return {"execution_mode": snapshot.get("execution_mode"), "available": False, "status": "NO_SANDBOX_DATA", "results": []}
+        return None
+
+    def _mobile_authorized(self, headers):
+        supplied = headers.get("Authorization", "")
+        return bool(self.mobile_token) and hmac.compare_digest(supplied, f"Bearer {self.mobile_token}")
+
+    async def _mobile_ws_handler(self, websocket, path=None):
+        request = getattr(websocket, "request", None)
+        request_path = path or getattr(websocket, "path", "") or getattr(request, "path", "")
+        parsed = urlsplit(request_path)
+        headers = getattr(websocket, "request_headers", None) or getattr(request, "headers", {})
+        if parsed.path != "/api/v1/mobile/stream" or not self._mobile_authorized(headers):
+            await websocket.close(code=1008, reason="Authentication required")
+            return
+        sequence = 0
+        previous = None
+        last_heartbeat = time.monotonic()
+        await websocket.send(json.dumps({
+            "protocol": "rkl.mobile.v1", "sequence": sequence, "event_id": "welcome",
+            "event_type": "WELCOME", "server_time": datetime.now().astimezone().isoformat(),
+            "source_timestamp": None, "payload": {"resync_required": False},
+        }))
+        while not self._stop.is_set():
+            serialized = json.dumps(self.state.snapshot(), default=_json_value, sort_keys=True)
+            if serialized != previous:
+                sequence += 1
+                await websocket.send(json.dumps({
+                    "protocol": "rkl.mobile.v1", "sequence": sequence,
+                    "event_id": f"snapshot-{sequence}",
+                    "event_type": "STATE_SNAPSHOT" if sequence == 1 else "STATE_DELTA",
+                    "server_time": datetime.now().astimezone().isoformat(),
+                    "source_timestamp": None, "payload": json.loads(serialized),
+                }))
+                previous = serialized
+                last_heartbeat = time.monotonic()
+            elif time.monotonic() - last_heartbeat >= 10:
+                sequence += 1
+                await websocket.send(json.dumps({
+                  "protocol": "rkl.mobile.v1", "sequence": sequence,
+                  "event_id": f"heartbeat-{sequence}", "event_type": "HEARTBEAT",
+                  "server_time": datetime.now().astimezone().isoformat(),
+                  "source_timestamp": None, "payload": {"stale": False},
+                }))
+                last_heartbeat = time.monotonic()
+            await asyncio.sleep(1)
+
+    def _start_mobile_ws(self):
+        if not self.mobile_token or websockets is None:
+            return
+        self.mobile_ws_stop = threading.Event()
+        self.mobile_ws_loop = asyncio.new_event_loop()
+        self.mobile_ws_async_stop = asyncio.Event()
+
+        def runner():
+            asyncio.set_event_loop(self.mobile_ws_loop)
+
+            async def serve():
+                self.mobile_ws_server = await websockets.serve(
+                    self._mobile_ws_handler, self.mobile_ws_host, self.mobile_ws_port,
+                    max_size=2 * 1024 * 1024,
+                )
+                await self.mobile_ws_async_stop.wait()
+                self.mobile_ws_server.close()
+                await self.mobile_ws_server.wait_closed()
+
+            try:
+                self.mobile_ws_loop.run_until_complete(serve())
+            except OSError as error:  # Mobile transport must not stop the trading engine.
+                print(f"[MOBILE WS] DISABLED: {error}", flush=True)
+            finally:
+                self.mobile_ws_loop.close()
+
+        self.mobile_ws_thread = threading.Thread(target=runner, name="mobile-websocket", daemon=True)
+        self.mobile_ws_thread.start()
 
     def start(self, open_browser=True):
         state = self.state
@@ -387,6 +546,28 @@ class DashboardServer:
                 return
 
             def do_GET(self):
+                parsed_path = urlsplit(self.path)
+                mobile_path = parsed_path.path
+                if mobile_path.startswith("/api/mobile/") or mobile_path.startswith("/api/v1/mobile/"):
+                    if not owner.mobile_token:
+                        self.send_error(404, "Mobile API is not configured")
+                        return
+                    if not owner._mobile_authorized(self.headers):
+                        self.send_error(401, "Authentication required")
+                        return
+                    mobile_payload = owner._mobile_payload(mobile_path, parse_qs(parsed_path.query))
+                    if mobile_payload is None:
+                        self.send_error(404)
+                        return
+                    payload = json.dumps(mobile_payload, default=_json_value).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
                 if self.path == "/health":
                     snapshot = state.snapshot()
                     components = snapshot.get("components", {})
@@ -479,6 +660,7 @@ class DashboardServer:
 
         self.thread = threading.Thread(target=self.server.serve_forever, name="local-dashboard", daemon=True)
         self.thread.start()
+        self._start_mobile_ws()
         self._wait_for_health(timeout=10)
         self._wait_for_root(timeout=10)
         if open_browser:
@@ -523,6 +705,8 @@ class DashboardServer:
 
     def stop(self):
         self._stop.set()
+        if self.mobile_ws_loop and self.mobile_ws_async_stop:
+            self.mobile_ws_loop.call_soon_threadsafe(self.mobile_ws_async_stop.set)
         if self.server:
             self.server.shutdown()
             self.server.server_close()

@@ -5,7 +5,9 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+from websockets.sync.client import connect
 
 from web_dashboard import DashboardServer
 
@@ -129,6 +131,71 @@ class DashboardServerTests(unittest.TestCase):
             self.assertIn("BANKNIFTY", html)
             self.assertIn("MIDCPNIFTY", html)
             self.assertIn("SENSEX", html)
+        finally:
+            server.stop()
+
+    def test_mobile_api_requires_bearer_token(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8771, mobile_token="test-token")
+        try:
+            server.start(open_browser=False)
+            with self.assertRaises(HTTPError) as error:
+                urlopen("http://127.0.0.1:8771/api/mobile/status", timeout=2)
+            self.assertEqual(error.exception.code, 401)
+        finally:
+            server.stop()
+
+    def test_mobile_api_returns_authoritative_status_with_token(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8772, mobile_token="test-token")
+        try:
+            server.start(open_browser=False)
+            request = Request(
+                "http://127.0.0.1:8772/api/mobile/status",
+                headers={"Authorization": "Bearer test-token"},
+            )
+            with urlopen(request, timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(payload["execution_mode"], None)
+            self.assertEqual(payload["components"]["DATABASE"], "READY")
+        finally:
+            server.stop()
+
+    def test_versioned_mobile_status_route_is_read_only(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8773, mobile_token="test-token")
+        try:
+            server.start(open_browser=False)
+            request = Request(
+                "http://127.0.0.1:8773/api/v1/mobile/status",
+                headers={"Authorization": "Bearer test-token"},
+            )
+            with urlopen(request, timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(payload["components"]["DATABASE"], "READY")
+            self.assertNotIn("control", payload)
+        finally:
+            server.stop()
+
+    def test_mobile_websocket_requires_authentication_and_streams_state(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8774, mobile_token="test-token")
+        try:
+            server.start(open_browser=False)
+            with self.assertRaises(Exception):
+                with connect("ws://127.0.0.1:8775/api/v1/mobile/stream", open_timeout=2) as websocket:
+                    websocket.recv(timeout=2)
+            with connect(
+                "ws://127.0.0.1:8775/api/v1/mobile/stream",
+                additional_headers={"Authorization": "Bearer test-token"},
+                open_timeout=2,
+            ) as websocket:
+                welcome = json.loads(websocket.recv(timeout=3))
+                snapshot = json.loads(websocket.recv(timeout=3))
+            self.assertEqual(welcome["event_type"], "WELCOME")
+            self.assertEqual(snapshot["protocol"], "rkl.mobile.v1")
+            self.assertIn("sequence", snapshot)
+            self.assertIn("payload", snapshot)
         finally:
             server.stop()
 

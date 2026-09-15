@@ -103,6 +103,9 @@ LIVE_VALIDATION_PATH = Path(os.getenv("LIVE_VALIDATION_PATH", str(ROOT / "logs" 
 DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1").strip()
 DASHBOARD_HEALTH_HOST = os.getenv("DASHBOARD_HEALTH_HOST", "127.0.0.1").strip()
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8765"))
+MOBILE_API_TOKEN = os.getenv("MOBILE_API_TOKEN", "").strip()
+MOBILE_WS_HOST = os.getenv("MOBILE_WS_HOST", DASHBOARD_HOST).strip()
+MOBILE_WS_PORT = int(os.getenv("MOBILE_WS_PORT", str(DASHBOARD_PORT + 1)))
 DEFAULT_OPEN_BROWSER = "ON" if os.name == "nt" and not os.environ.get("CI") else "OFF"
 OPEN_BROWSER = os.getenv("OPEN_BROWSER", DEFAULT_OPEN_BROWSER).strip().upper() == "ON"
 

@@ -27,6 +27,7 @@ from signals.rsi_filter import validate_rsi_entry
 from signals.audit import SignalAudit
 from signals.candidate_trace import CandidateTrace
 from storage.sqlite_store import CandleStore
+from observability import Observability
 from services.preflight import run_local_preflight
 from terminal_display import TerminalDisplay
 from web_dashboard import DashboardServer
@@ -52,13 +53,14 @@ class MarketDataService:
         self.stop_event = threading.Event()
         self.instruments = resolve_indices()
         self.store = CandleStore(config.DATABASE_PATH, mode=config.EXECUTION_MODE)
+        self.observability = Observability(self.store)
         self.display = TerminalDisplay(self.instruments)
         self.engines = {name: CandleEngine(self._on_candle_closed) for name in self.instruments}
         self.option_engines = {}
         self.option_contracts = {}
         self.option_centers = {}
         self.option_refresh_lock = threading.Lock()
-        self.signal_trace = CandidateTrace(config.SIGNAL_TRACE_PATH, config.SIGNAL_TRACE_ENABLED)
+        self.signal_trace = CandidateTrace(config.SIGNAL_TRACE_PATH, config.SIGNAL_TRACE_ENABLED, self._record_signal_candidate)
         self.breakouts = {name: BreakoutEngine(self.signal_trace.write) for name in self.instruments}
         self.type2_engines = {name: Type2Engine(self.signal_trace.write) for name in self.instruments}
         self.coordinator = SignalCoordinator(expiry_seconds=60)
@@ -68,7 +70,7 @@ class MarketDataService:
         self.signal_audit = SignalAudit(config.SIGNAL_AUDIT_PATH)
         self.live_validation_report = LiveBrokerValidationReport(config.LIVE_VALIDATION_PATH)
         self.health = FeedHealth(config.STALE_DATA_SECONDS)
-        self.adapter = UpstoxAdapter(self._on_tick, self._on_status, self._on_raw_market_event, self._on_portfolio_event)
+        self.adapter = UpstoxAdapter(self._on_tick, self._on_status, self._on_raw_market_event, self._on_portfolio_event, self._record_broker_telemetry)
         self.adapter.set_instruments(self.instruments)
         self._restore_last_market_state()
         self.order_manager = None
@@ -85,11 +87,17 @@ class MarketDataService:
         self.option_history_lock = threading.Lock()
         self.exit_lock = threading.Lock()
         self.websocket_started = False
+        self.tick_count = 0
+        self.last_tick_timestamp = None
         self.dashboard_started = False
         self.preflight_result = None
         self.stop_reason = None
         self.lifecycle_log = config.ROOT / "logs" / "service_lifecycle.log"
-        self.dashboard = DashboardServer(self.display, config.DASHBOARD_HOST, config.DASHBOARD_PORT)
+        self.dashboard = DashboardServer(
+            self.display, config.DASHBOARD_HOST, config.DASHBOARD_PORT,
+            mobile_token=config.MOBILE_API_TOKEN, store=self.store,
+            mobile_ws_host=config.MOBILE_WS_HOST, mobile_ws_port=config.MOBILE_WS_PORT,
+        )
 
     def _lifecycle(self, message):
         line = f"{datetime.now(IST).isoformat()} {message}"
@@ -255,6 +263,7 @@ class MarketDataService:
         self._lifecycle(f"[SERVICE] STOP EVENT SET reason={self.stop_reason or 'unknown'}")
 
     def _authenticate_and_validate(self):
+        self.observability.event("AUTH_START", component="AUTH", resolution="OBSERVED")
         print("[AUTH] STARTING UPSTOX AUTHENTICATION", flush=True)
         print("[AUTH] CREDENTIALS_LOADED", flush=True)
         self.display.set_component("AUTH", "AUTH_REQUEST_STARTED")
@@ -262,6 +271,8 @@ class MarketDataService:
             self.adapter.authenticate()
         except RuntimeError as error:
             classification = "TOKEN_MISSING" if "Missing" in str(error) else "AUTHENTICATION ERROR"
+            self.observability.event("AUTH_END", component="AUTH", severity="ERROR", message=str(error),
+                                     payload={"success": False, "token_status": classification})
             self.display.set_component("AUTH", classification)
             raise AuthenticationStartupBlocked(classification) from error
         print("[AUTH] TOKEN_LOADED", flush=True)
@@ -269,9 +280,11 @@ class MarketDataService:
         print("[AUTH] VALIDATING TOKEN WITH UPSTOX...", flush=True)
         result = self.adapter.validate_token()
         if result != "TOKEN VALID":
+            self.observability.event("AUTH_END", component="AUTH", severity="ERROR", message=result, payload={"success": False, "token_status": result})
             self.display.set_component("AUTH", result)
             raise AuthenticationStartupBlocked(result)
         self.display.set_component("AUTH", "AUTHENTICATED")
+        self.observability.event("AUTH_END", component="AUTH", payload={"success": True, "token_status": result})
         print("[AUTH] TOKEN_VALIDATED", flush=True)
         print("[AUTH] AUTHENTICATED", flush=True)
 
@@ -293,6 +306,10 @@ class MarketDataService:
                 print("[SHUTDOWN] DASHBOARD STOPPED", flush=True)
             elif not self.websocket_started:
                 print("[SHUTDOWN] NO ACTIVE MARKET-DATA SERVICES", flush=True)
+            try:
+                self.observability.daily_report()
+            except Exception as error:
+                self._lifecycle(f"[OBSERVABILITY] REPORT FAILED: {error}")
             self.store.close()
             print("[SHUTDOWN] DATABASE CLOSED", flush=True)
             self.display.restore_terminal()
@@ -310,6 +327,8 @@ class MarketDataService:
                 self.display.set_option_quote(tick.token, tick)
                 self._try_activate_execution_preflight()
                 return
+            self.tick_count += 1
+            self.last_tick_timestamp = tick.timestamp
             if not self._is_market_open(tick.timestamp):
                 self._lifecycle(
                     f"[MARKET-TIME] instrument={tick.instrument} raw_timestamp={tick.timestamp.isoformat()} "
@@ -475,6 +494,12 @@ class MarketDataService:
     def _on_candle_closed(self, candle):
         try:
             reconciliation = self.store.reconcile(candle)
+            self.observability.event("CANDLE_COMPLETED", component="CANDLES", payload={
+                "instrument": candle.instrument, "expected_timestamp": candle.timestamp.isoformat(),
+                "actual_timestamp": candle.timestamp.isoformat(), "open": candle.open, "high": candle.high,
+                "low": candle.low, "close": candle.close, "volume": candle.volume,
+                "reconciliation": reconciliation,
+            }, resolution="OBSERVED")
         except Exception as error:
             self._halt_trading(f"Database candle persistence failed: {error}")
             self._record_event("DATABASE_FAILURE", {"instrument": candle.instrument, "reason": str(error)})
@@ -628,12 +653,26 @@ class MarketDataService:
         except Exception as error:
             self._halt_trading(f"Raw market-event persistence failed: {error}")
 
+    def _record_broker_telemetry(self, event_type, payload):
+        severity = "ERROR" if event_type == "API_ERROR" else "INFO"
+        self.observability.event(event_type, component="BROKER", severity=severity,
+                                 message=payload.get("error", ""), payload=payload)
+
+    def _record_signal_candidate(self, payload):
+        self.observability.event(payload.get("reason_code", "SIGNAL_CANDIDATE"), component="SIGNALS",
+                                 payload=payload, resolution="OBSERVED")
+
     def _on_portfolio_event(self, event):
         self._record_event("PORTFOLIO_STREAM_EVENT", {"payload": event})
         if self.position_manager and not self.stop_event.is_set():
             threading.Thread(target=self._reconcile_positions,
                              name="portfolio-reconciliation", daemon=True).start()
     def _on_status(self, status):
+        status_upper = status.upper()
+        component = "WEBSOCKET" if "FEED" in status_upper or "WEBSOCKET" in status_upper else "SYSTEM"
+        severity = "ERROR" if "ERROR" in status_upper or "FAILED" in status_upper else ("RECOVERY" if "RECOVER" in status_upper else "INFO")
+        self.observability.event(status.replace(" ", "_")[:80], component=component, severity=severity,
+                     message=status, resolution="OBSERVED")
         if status in {"WEBSOCKET CONNECTED", "UPSTOX FEED CONNECTED"} or status.startswith("UPSTOX FEED CONNECTED "):
             self.display.set_component("DATA FEED", "LIVE")
             self.display.set_component("CANDLES", "READY")
@@ -655,6 +694,13 @@ class MarketDataService:
 
     def _record_event(self, event_type, values, table="system_events"):
         try:
+            component = {"signal_events": "SIGNALS", "reconciliation_events": "HISTORY", "orders": "ORDERS",
+                         "fills": "ORDERS", "approvals": "ORDERS", "position_events": "ORDERS"}.get(table, "SYSTEM")
+            if event_type.startswith("OPTION_") or event_type.startswith("ATM_"):
+                component = "OPTIONS"
+            severity = "HALT" if "HALT" in event_type else ("ERROR" if "FAIL" in event_type or "ERROR" in event_type or "MISMATCH" in event_type else "INFO")
+            self.observability.event(event_type, component=component, severity=severity, message=str(values.get("reason", "")),
+                                     system_state=str(self.trading_state), payload=values, resolution="OBSERVED")
             primary_id = str(uuid4())
             created_at = datetime.now(IST).isoformat()
             details = dict(values)
@@ -866,6 +912,12 @@ class MarketDataService:
             self._on_status(f"REST SYNC FAILED {instrument.name}: {error}")
             return {"instrument": instrument.name, "status": "FAILED", "error": str(error)}
         finally:
+            if hasattr(self, "observability"):
+                self.observability.event("HISTORY_SYNC", component="HISTORY", severity="INFO" if not self.reconciliation_blocked.intersection({instrument.name}) else "ERROR",
+                                         payload={"instrument": instrument.name, "candles_received": len(candles) if 'candles' in locals() else 0,
+                                                  "fetch_latency_ms": round(fetch_elapsed * 1000, 3), "total_latency_ms": round((time.monotonic() - total_started) * 1000, 3),
+                                                  "status": "SYNCED" if 'candles' in locals() and candles and not self.reconciliation_blocked.intersection({instrument.name}) else "FAILED"},
+                                         resolution="OBSERVED")
             total_elapsed = time.monotonic() - total_started
             print(
                 f"[BACKFILL TIMING] {instrument.name} "
@@ -929,6 +981,20 @@ class MarketDataService:
                 self.display.set_sync(name, feed_health=self.health.diagnostics(name),
                                       subscription_state="SUBSCRIBED",
                                       websocket_state=self.display.snapshot()["ws_status"])
+            self.observability.heartbeat({
+                "AUTH": self.display.snapshot()["components"].get("AUTH"),
+                "DATABASE": self.display.snapshot()["components"].get("DATABASE"),
+                "WEBSOCKET": self.display.snapshot()["ws_status"],
+                "HISTORY": self.display.snapshot()["components"].get("HISTORY"),
+                "CANDLES": self.display.snapshot()["components"].get("CANDLES"),
+                "SIGNALS": self.display.snapshot()["components"].get("SIGNALS"),
+                "OPTIONS": self.display.snapshot()["components"].get("OPTIONS"),
+                "ORDERS": self.display.snapshot()["components"].get("ORDERS"),
+                "SYSTEM": str(self.trading_state),
+                "tick_count": self.tick_count,
+                "last_tick_timestamp": self.last_tick_timestamp.isoformat() if self.last_tick_timestamp else None,
+                "feed_health": {name: self.health.diagnostics(name) for name in self.instruments},
+            })
             if (datetime.now(IST) - last_reconciliation).total_seconds() < config.REST_SYNC_INTERVAL_SECONDS:
                 continue
             last_reconciliation = datetime.now(IST)
@@ -1242,7 +1308,17 @@ class MarketDataService:
             if not reserved:
                 self._halt_trading(f"Duplicate or unresolved order request {signal_event.signal_id}")
                 return
+            order_request_started = time.perf_counter()
+            self.observability.event("ORDER_REQUEST_SENT", component="ORDERS", payload={
+                "signal_id": signal_event.signal_id, "symbol": option["symbol"],
+                "token": option["token"], "quantity": option["lot_size"],
+            }, resolution="OBSERVED")
             order = self.order_manager.place_approved_buy(option, option["lot_size"], request_id=signal_event.signal_id)
+            self.observability.event("ORDER_ACCEPTED", component="ORDERS", payload={
+                "signal_id": signal_event.signal_id, "order_id": order["order_id"],
+                "signal_to_order_latency_ms": round((time.perf_counter() - order_request_started) * 1000, 3),
+                "broker_response": order.get("broker_response"),
+            }, resolution="OBSERVED")
             self.store.update_order_request(signal_event.signal_id, "SUBMITTED", order["order_id"])
             self.display.set_orders([f"{order['order_id']} BUY {option['symbol']} QTY:{option['lot_size']} STATUS:SUBMITTED"])
             self._validation_record({
@@ -1268,6 +1344,8 @@ class MarketDataService:
                     "quantity": option["lot_size"],
                 })
             self._record_event(event_type, rejection_details)
+            self.observability.event(event_type, component="ORDERS", severity="ERROR" if event_type == "ORDER_REJECTED" else "CRITICAL",
+                                     message=message, payload=rejection_details, resolution="OBSERVED")
             if config.LIVE_BROKER_VALIDATION_ENABLED:
                 order_book_status = None
                 broker_order_id = getattr(error, "order_id", None)
@@ -1372,6 +1450,10 @@ class MarketDataService:
             self.position_manager.register_fill(position, order["order_id"], fill_price, filled_quantity)
             self._record_event("BUY_FILLED", {"order_id": order["order_id"], "trade_id": trade_id,
                                                "quantity": filled_quantity, "average_price": fill_price}, "fills")
+            self.observability.event("ORDER_FILLED", component="ORDERS", payload={
+                "order_id": order["order_id"], "trade_id": trade_id,
+                "quantity": filled_quantity, "average_price": fill_price,
+            }, resolution="OBSERVED")
             self.store.record("positions", trade_id, {
                     "signal_id": signal_event.signal_id, "signal_type": signal_event.signal_type,
                     "underlying": signal_event.underlying, "direction": signal_event.direction,

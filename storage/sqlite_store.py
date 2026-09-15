@@ -64,6 +64,8 @@ class CandleStore:
             "system_events": "event_id TEXT PRIMARY KEY, event_type TEXT, created_at TEXT, payload TEXT",
             "order_requests": "request_id TEXT PRIMARY KEY, signal_id TEXT, position_id TEXT, order_type TEXT, symbol TEXT, token TEXT, quantity INTEGER, created_at TEXT, broker_order_id TEXT, state TEXT, payload TEXT",
             "raw_market_events": "event_id TEXT PRIMARY KEY, instrument_key TEXT, exchange TEXT, exchange_timestamp TEXT, received_timestamp TEXT, ltp REAL, volume INTEGER, source TEXT, sequence INTEGER, payload TEXT",
+            "telemetry_events": "event_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, severity TEXT NOT NULL, component TEXT NOT NULL, event_type TEXT NOT NULL, message TEXT, exception TEXT, system_state TEXT, recovery_action TEXT, resolution TEXT, payload TEXT",
+            "daily_reports": "report_date TEXT PRIMARY KEY, generated_at TEXT NOT NULL, status TEXT NOT NULL, payload TEXT",
         }.items():
             self.connection.execute(f"CREATE TABLE IF NOT EXISTS {table} ({columns})")
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(candles)")}
@@ -328,3 +330,59 @@ class CandleStore:
             except Exception:
                 self.connection.rollback()
                 raise
+
+    def record_telemetry(self, event_id, values):
+        row = dict(values)
+        row["event_id"] = event_id
+        row.setdefault("timestamp", datetime.now().astimezone().isoformat())
+        row.setdefault("severity", "INFO")
+        row.setdefault("component", "SYSTEM")
+        row.setdefault("event_type", "EVENT")
+        row.setdefault("message", "")
+        row.setdefault("exception", "")
+        row.setdefault("system_state", "")
+        row.setdefault("recovery_action", "")
+        row.setdefault("resolution", "UNRESOLVED")
+        payload = row.get("payload", {})
+        row["payload"] = json.dumps(payload, default=str)
+        columns = list(row)
+        placeholders = ", ".join("?" for _ in columns)
+        with self.lock:
+            self.connection.execute(
+                f"INSERT OR REPLACE INTO telemetry_events ({', '.join(columns)}) VALUES ({placeholders})",
+                [row[column] for column in columns],
+            )
+            self.connection.commit()
+
+    def telemetry_events(self, report_date=None):
+        with self.lock:
+            if report_date:
+                return self.connection.execute(
+                    "SELECT timestamp, severity, component, event_type, message, exception, system_state, recovery_action, resolution, payload "
+                    "FROM telemetry_events WHERE timestamp LIKE ? ORDER BY timestamp",
+                    (f"{report_date}%",),
+                ).fetchall()
+            return self.connection.execute(
+                "SELECT timestamp, severity, component, event_type, message, exception, system_state, recovery_action, resolution, payload "
+                "FROM telemetry_events ORDER BY timestamp"
+            ).fetchall()
+
+    def save_daily_report(self, report_date, report):
+        with self.lock:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO daily_reports (report_date, generated_at, status, payload) VALUES (?, ?, ?, ?)",
+                (report_date, datetime.now().astimezone().isoformat(), report.get("status", "NOT OBSERVED"),
+                 json.dumps(report, default=str)),
+            )
+            self.connection.commit()
+
+    def daily_reports(self):
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT report_date, generated_at, status, payload FROM daily_reports ORDER BY report_date DESC"
+            ).fetchall()
+        return [
+            {"report_date": row[0], "generated_at": row[1], "status": row[2],
+             "payload": json.loads(row[3] or "{}")}
+            for row in rows
+        ]

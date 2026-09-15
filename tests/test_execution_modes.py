@@ -1,15 +1,121 @@
 import json
+import threading
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from broker.order_manager import OrderExecutor
+from main import MarketDataService
+from services.preflight import PreflightResult
 from storage.sqlite_store import CandleStore
 from services.preflight import run_local_preflight
 
 
 class ExecutionModeTests(unittest.TestCase):
+    def _preflight_service(self, result):
+        service = MarketDataService.__new__(MarketDataService)
+        service.display = MagicMock()
+        service.store = MagicMock()
+        service.instruments = {}
+        service.position_manager = None
+        service.order_manager = None
+        service.public_ip = None
+        return service, result
+
+    def _startup_preflight_service(self):
+        service = MarketDataService.__new__(MarketDataService)
+        service.display = MagicMock()
+        service.display.lock = threading.Lock()
+        service.display.rest_status = {"NIFTY": "SYNCED"}
+        service.store = MagicMock()
+        service.instruments = {"NIFTY": MagicMock()}
+        service.position_manager = None
+        service.order_manager = None
+        service.public_ip = None
+        service.stop_event = MagicMock()
+        service.stop_event.is_set.return_value = False
+        service.stop_event.wait.return_value = True
+        service.dashboard = MagicMock()
+        service.dashboard.start.return_value = "http://127.0.0.1:8765/"
+        service.adapter = MagicMock()
+        service.safety = MagicMock()
+        service.safety.state = "RUNNING"
+        service.trading_state = "RUNNING"
+        service.recovery_required = False
+        service.websocket_started = False
+        service.dashboard_started = False
+        service.stop_reason = None
+        service._lifecycle = MagicMock()
+        service._authenticate_and_validate = MagicMock()
+        service._check_public_ip = MagicMock()
+        service._reconcile_positions = MagicMock()
+        service._reconcile_order_requests = MagicMock()
+        service._backfill = MagicMock()
+        service._initialize_option_universe = MagicMock()
+        service._periodic_sync = MagicMock()
+        return service
+
+    def _assert_startup_preflight_does_not_open_gate(self, mode):
+        service = self._startup_preflight_service()
+        result = PreflightResult(True, "2026-09-12T09:15:00+05:30")
+        with patch("config.EXECUTION_MODE", mode), \
+             patch("config.ENABLE_REAL_ORDERS", True), \
+             patch("config.PREFLIGHT_PASSED", False), \
+             patch("config.validate_runtime"), \
+             patch("main.run_local_preflight", return_value=result), \
+             patch("main.threading.Thread"):
+            service.start()
+            self.assertTrue(result.passed)
+            self.assertFalse(__import__("config").PREFLIGHT_PASSED)
+            self.assertFalse(__import__("config").order_execution_enabled())
+
+    def test_production_startup_preflight_pass_is_readiness_only(self):
+        self._assert_startup_preflight_does_not_open_gate("PRODUCTION")
+
+    def test_sandbox_startup_preflight_pass_is_readiness_only(self):
+        self._assert_startup_preflight_does_not_open_gate("SANDBOX")
+
+    def test_production_preflight_pass_opens_execution_gate(self):
+        result = PreflightResult(True, "2026-09-12T09:15:00+05:30")
+        service, _ = self._preflight_service(result)
+        with patch("config.EXECUTION_MODE", "PRODUCTION"), \
+               patch("config.ENABLE_REAL_ORDERS", True), \
+             patch("config.PREFLIGHT_PASSED", False), \
+             patch("main.run_local_preflight", return_value=result):
+            service._try_activate_execution_preflight()
+            self.assertTrue(__import__("config").PREFLIGHT_PASSED)
+            self.assertTrue(__import__("config").order_execution_enabled())
+
+    def test_production_preflight_failure_keeps_execution_gate_closed(self):
+        result = PreflightResult(False, "2026-09-12T09:15:00+05:30", failures=("database_healthy",))
+        service, _ = self._preflight_service(result)
+        with patch("config.EXECUTION_MODE", "PRODUCTION"), \
+             patch("config.PREFLIGHT_PASSED", False), \
+             patch("main.run_local_preflight", return_value=result):
+            service._try_activate_execution_preflight()
+            self.assertFalse(__import__("config").PREFLIGHT_PASSED)
+            self.assertFalse(__import__("config").order_execution_enabled())
+
+    def test_sandbox_preflight_pass_opens_execution_gate(self):
+        result = PreflightResult(True, "2026-09-12T09:15:00+05:30")
+        service, _ = self._preflight_service(result)
+        with patch("config.EXECUTION_MODE", "SANDBOX"), \
+               patch("config.ENABLE_REAL_ORDERS", True), \
+             patch("config.PREFLIGHT_PASSED", False), \
+             patch("main.run_local_preflight", return_value=result):
+            service._try_activate_execution_preflight()
+            self.assertTrue(__import__("config").PREFLIGHT_PASSED)
+            self.assertTrue(__import__("config").order_execution_enabled())
+
+    def test_read_only_and_backtest_cannot_execute_real_orders(self):
+        for mode in ("READ_ONLY", "BACKTEST"):
+            with self.subTest(mode=mode), \
+                 patch("config.EXECUTION_MODE", mode), \
+                 patch("config.ENABLE_REAL_ORDERS", True), \
+                 patch("config.PREFLIGHT_PASSED", True):
+                self.assertFalse(__import__("config").order_execution_enabled())
+
     def test_order_gate_requires_production_mode_and_preflight(self):
         with patch("config.ENABLE_REAL_ORDERS", True), \
              patch("config.EXECUTION_MODE", "PRODUCTION"), \
@@ -19,6 +125,16 @@ class ExecutionModeTests(unittest.TestCase):
              patch("config.EXECUTION_MODE", "PRODUCTION"), \
              patch("config.PREFLIGHT_PASSED", True):
             self.assertTrue(__import__("config").order_execution_enabled())
+
+    def test_order_boundary_rejects_when_preflight_has_not_passed(self):
+        client = MagicMock()
+        executor = OrderExecutor(client)
+        with patch("config.ENABLE_REAL_ORDERS", True), \
+             patch("config.EXECUTION_MODE", "PRODUCTION"), \
+             patch("config.PREFLIGHT_PASSED", False):
+            with self.assertRaisesRegex(RuntimeError, "Real orders are disabled"):
+                executor.place_approved_buy({"lot_size": 1, "token": "TOKEN"}, 1)
+        client.place_order.assert_not_called()
 
     def test_read_only_mode_disables_auto_entry_reporting(self):
         with patch("config.EXECUTION_MODE", "READ_ONLY"), \
