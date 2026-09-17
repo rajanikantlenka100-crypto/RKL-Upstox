@@ -33,6 +33,7 @@ AUTO_TRADING_ENABLED = os.getenv("AUTO_TRADING_ENABLED", "OFF").strip().upper() 
 AUTO_ENTRY_ENABLED = os.getenv("AUTO_ENTRY_ENABLED", "ON").strip().upper() == "ON"
 SIGNAL_TYPE_1_ENABLED = os.getenv("SIGNAL_TYPE_1_ENABLED", "ON").strip().upper() == "ON"
 SIGNAL_TYPE_2_ENABLED = os.getenv("SIGNAL_TYPE_2_ENABLED", "ON").strip().upper() == "ON"
+SIGNAL_TYPE_3_ENABLED = os.getenv("SIGNAL_TYPE_3_ENABLED", "ON").strip().upper() == "ON"
 MANUAL_APPROVAL_ENABLED = os.getenv("MANUAL_APPROVAL_ENABLED", "ON").strip().upper() == "ON"
 WEBSOCKET_ENABLED = os.getenv("WEBSOCKET_ENABLED", "ON").strip().upper() == "ON"
 HISTORICAL_SYNC_ENABLED = os.getenv("HISTORICAL_SYNC_ENABLED", "ON").strip().upper() == "ON"
@@ -66,7 +67,7 @@ def _market_time(name, default):
 
 
 MARKET_OPEN = _market_time("MARKET_OPEN", "09:15")
-MARKET_CLOSE = _market_time("MARKET_CLOSE", "15:30")
+MARKET_CLOSE = _market_time("MARKET_CLOSE", "15:15")
 ACTIVE_INDEXES = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")
 INSTRUMENTS = tuple(item.strip().upper() for item in os.getenv("INSTRUMENTS", ",".join(ACTIVE_INDEXES)).split(",") if item.strip())
 INDEX_KEYS = {"NIFTY": "NSE_INDEX|Nifty 50", "BANKNIFTY": "NSE_INDEX|Nifty Bank", "FINNIFTY": "NSE_INDEX|Nifty Fin Service", "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT", "SENSEX": "BSE_INDEX|SENSEX"}
@@ -78,6 +79,7 @@ RSI_SMA_PERIOD = int(os.getenv("RSI_SMA_PERIOD", "5"))
 RSI_LOOKBACK_PERIODS = int(os.getenv("RSI_LOOKBACK_PERIODS", "5"))
 SL_BUFFER = float(os.getenv("SL_BUFFER", "1.0"))
 LOT_COUNT = int(os.getenv("LOT_COUNT", "1"))
+SANDBOX_INITIAL_CAPITAL = float(os.getenv("SANDBOX_INITIAL_CAPITAL", "200000"))
 REST_SYNC_INTERVAL_SECONDS = int(os.getenv("REST_SYNC_INTERVAL_SECONDS", "7200"))
 HISTORICAL_LOOKBACK_DAYS = int(os.getenv("HISTORICAL_LOOKBACK_DAYS", "10"))
 HISTORICAL_COUNT = int(os.getenv("HISTORICAL_COUNT", "100"))
@@ -86,6 +88,8 @@ REAL_ORDERS_ENABLED = os.getenv("REAL_ORDERS_ENABLED", "OFF").strip().upper()
 if REAL_ORDERS_ENABLED not in {"ON", "OFF"}:
     raise RuntimeError("REAL_ORDERS_ENABLED must be ON or OFF")
 ENABLE_REAL_ORDERS = REAL_ORDERS_ENABLED == "ON"
+SANDBOX_FILL_MODEL = os.getenv("SANDBOX_FILL_MODEL", "MARKET_LTP").strip().upper()
+SANDBOX_SLIPPAGE = float(os.getenv("SANDBOX_SLIPPAGE", "0"))
 LIVE_BROKER_VALIDATION = os.getenv("LIVE_BROKER_VALIDATION", "OFF").strip().upper()
 if LIVE_BROKER_VALIDATION not in {"ON", "OFF"}:
     raise RuntimeError("LIVE_BROKER_VALIDATION must be ON or OFF")
@@ -100,6 +104,18 @@ SIGNAL_TRACE_ENABLED = os.getenv("SIGNAL_TRACE_ENABLED", "ON").strip().upper() =
 SIGNAL_TRACE_PATH = Path(os.getenv("SIGNAL_TRACE_PATH", str(ROOT / "logs" / "signal_candidate_trace.jsonl")))
 SIGNAL_AUDIT_PATH = Path(os.getenv("SIGNAL_AUDIT_PATH", str(ROOT / "logs" / "signal_audit.jsonl")))
 LIVE_VALIDATION_PATH = Path(os.getenv("LIVE_VALIDATION_PATH", str(ROOT / "logs" / "live_broker_validation.jsonl")))
+RAW_MARKET_RETENTION_DAYS = int(os.getenv("RAW_MARKET_RETENTION_DAYS", "7"))
+TELEMETRY_RETENTION_DAYS = int(os.getenv("TELEMETRY_RETENTION_DAYS", "30"))
+RAW_MARKET_EVENTS_ENABLED = os.getenv(
+    "RAW_MARKET_EVENTS_ENABLED", "OFF" if EXECUTION_MODE == "PRODUCTION" else "ON"
+).strip().upper() == "ON"
+RAW_MARKET_MAX_ROWS = int(os.getenv("RAW_MARKET_MAX_ROWS", "250000"))
+TELEMETRY_MAX_ROWS = int(os.getenv("TELEMETRY_MAX_ROWS", "250000"))
+STORAGE_WARNING_BYTES = int(os.getenv("STORAGE_WARNING_BYTES", str(5 * 1024 * 1024 * 1024)))
+STORAGE_HARD_LIMIT_BYTES = int(os.getenv("STORAGE_HARD_LIMIT_BYTES", str(8 * 1024 * 1024 * 1024)))
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(50 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+STORAGE_MAINTENANCE_INTERVAL_SECONDS = int(os.getenv("STORAGE_MAINTENANCE_INTERVAL_SECONDS", "900"))
 DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1").strip()
 DASHBOARD_HEALTH_HOST = os.getenv("DASHBOARD_HEALTH_HOST", "127.0.0.1").strip()
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8765"))
@@ -156,6 +172,14 @@ def validate_runtime():
     if (TIMEFRAME_MINUTES <= 0 or HISTORICAL_COUNT <= 0 or HISTORICAL_LOOKBACK_DAYS <= 0
             or UPSTOX_REQUEST_TIMEOUT_SECONDS <= 0):
         raise RuntimeError("TIMEFRAME_MINUTES, HISTORICAL_COUNT, HISTORICAL_LOOKBACK_DAYS, and UPSTOX_REQUEST_TIMEOUT_SECONDS must be positive")
+    if LOT_COUNT <= 0:
+        raise RuntimeError("LOT_COUNT must be positive")
+    if (RAW_MARKET_RETENTION_DAYS <= 0 or TELEMETRY_RETENTION_DAYS <= 0
+            or RAW_MARKET_MAX_ROWS <= 0 or TELEMETRY_MAX_ROWS <= 0
+            or STORAGE_WARNING_BYTES <= 0 or STORAGE_HARD_LIMIT_BYTES <= STORAGE_WARNING_BYTES
+            or LOG_MAX_BYTES <= 0 or LOG_BACKUP_COUNT < 1
+            or STORAGE_MAINTENANCE_INTERVAL_SECONDS <= 0):
+        raise RuntimeError("Retention, log rotation, and storage maintenance settings must be positive")
     if MARKET_OPEN >= MARKET_CLOSE:
         raise RuntimeError("MARKET_OPEN must be earlier than MARKET_CLOSE")
     if MARKET_DATA_MODE == "polling" and WEBSOCKET_ENABLED:
@@ -170,10 +194,14 @@ def validate_runtime():
         raise RuntimeError("PRODUCTION requires ORDER_ENV=live")
     if EXECUTION_MODE == "PRODUCTION" and not AUTO_TRADING_ENABLED:
         raise RuntimeError("PRODUCTION requires AUTO_TRADING_ENABLED=ON")
-    if EXECUTION_MODE == "SANDBOX" and (not ENABLE_REAL_ORDERS or ORDER_ENV != "sandbox"):
-        raise RuntimeError("SANDBOX requires REAL_ORDERS_ENABLED=ON and ORDER_ENV=sandbox")
+    if EXECUTION_MODE == "SANDBOX" and (ENABLE_REAL_ORDERS or ORDER_ENV != "sandbox"):
+        raise RuntimeError("SANDBOX requires REAL_ORDERS_ENABLED=OFF and ORDER_ENV=sandbox")
     if ORDER_ENV == "sandbox" and EXECUTION_MODE != "SANDBOX":
         raise RuntimeError("ORDER_ENV=sandbox requires EXECUTION_MODE=SANDBOX")
+    if SANDBOX_FILL_MODEL not in {"MARKET_LTP"}:
+        raise RuntimeError("SANDBOX_FILL_MODEL must be MARKET_LTP")
+    if SANDBOX_SLIPPAGE < 0:
+        raise RuntimeError("SANDBOX_SLIPPAGE must be non-negative")
     if not HISTORICAL_SYNC_ENABLED:
         raise RuntimeError("HISTORICAL_SYNC_ENABLED must be ON because signals require broker history")
     if LIVE_BROKER_VALIDATION_ENABLED and not ENABLE_REAL_ORDERS:
@@ -209,7 +237,9 @@ def execution_status_label():
 
 
 def order_execution_enabled():
-    return ENABLE_REAL_ORDERS and EXECUTION_MODE in {"SANDBOX", "PRODUCTION"} and PREFLIGHT_PASSED
+    if EXECUTION_MODE == "SANDBOX":
+        return PREFLIGHT_PASSED and not ENABLE_REAL_ORDERS
+    return ENABLE_REAL_ORDERS and EXECUTION_MODE == "PRODUCTION" and PREFLIGHT_PASSED
 
 
 PREFLIGHT_PASSED = False

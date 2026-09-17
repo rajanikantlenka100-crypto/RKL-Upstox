@@ -199,6 +199,71 @@ class DashboardServerTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_observer_snapshot_returns_canonical_envelope(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8776, mobile_token="test-token")
+        try:
+            server.start(open_browser=False)
+            with urlopen("http://127.0.0.1:8776/api/v1/observer/snapshot", timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(payload["protocol"], "rkl.observer.v1")
+            self.assertEqual(payload["event_type"], "STATE_SNAPSHOT")
+            self.assertIsNone(payload["state_version"])
+            self.assertIsNone(payload["source_timestamp"])
+            self.assertIn("SystemHealth", payload["payload"])
+        finally:
+            server.stop()
+
+    def test_observer_websocket_sends_snapshots_not_false_deltas(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8777, mobile_token="test-token")
+        try:
+            server.start(open_browser=False)
+            with connect("ws://127.0.0.1:8778/api/v1/observer/stream", open_timeout=2) as websocket:
+                welcome = json.loads(websocket.recv(timeout=3))
+                snapshot = json.loads(websocket.recv(timeout=3))
+            self.assertEqual(welcome["protocol"], "rkl.observer.v1")
+            self.assertEqual(welcome["event_type"], "WELCOME")
+            self.assertEqual(snapshot["event_type"], "STATE_SNAPSHOT")
+            self.assertNotEqual(snapshot["event_type"], "STATE_DELTA")
+            self.assertIsNone(snapshot["state_version"])
+            self.assertIn("SystemHealth", snapshot["payload"])
+        finally:
+            server.stop()
+
+    def test_dashboard_html_contains_pipeline_targets_and_no_stop_loss_label(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8779)
+        try:
+            server.start(open_browser=False)
+            with urlopen("http://127.0.0.1:8779/", timeout=2) as response:
+                html = response.read().decode("utf-8")
+            self.assertIn('id="pipelineGrid"', html)
+            self.assertIn('id="pipelineStateLabel"', html)
+            self.assertIn("ATM OPTION EXECUTION", html)
+            self.assertNotIn("Option / stop-loss", html)
+        finally:
+            server.stop()
+
+    def test_dashboard_html_is_five_minute_only_and_has_premium_observer_sections(self):
+        state = FakeState()
+        server = DashboardServer(state, "127.0.0.1", 8780)
+        try:
+            server.start(open_browser=False)
+            with urlopen("http://127.0.0.1:8780/", timeout=2) as response:
+                html = response.read().decode("utf-8")
+            self.assertIn("Prev2 5M", html)
+            self.assertIn("Previous 5M", html)
+            self.assertIn("Running 5M", html)
+            self.assertIn("Fills", html)
+            self.assertIn("Exit monitor", html)
+            self.assertIn("Incidents", html)
+            self.assertIn("Report", html)
+            self.assertNotIn("3M", html)
+            self.assertNotIn("3-minute", html)
+        finally:
+            server.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

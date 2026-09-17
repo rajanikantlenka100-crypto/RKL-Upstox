@@ -2,8 +2,7 @@ import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from instruments.options import (OptionContract, _expiry_date, round_to_tick, select_atm_option,
-                                 validate_option_candle, validate_option_candle_identity)
+from instruments.options import OptionContract, _expiry_date, round_to_tick, select_atm_option
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -12,24 +11,6 @@ class OptionResolutionTests(unittest.TestCase):
     def setUp(self):
         self.expiry = (datetime.now(IST).date() + timedelta(days=7)).isoformat()
         self.contract = OptionContract("NIFTY", "2026-09-10", 25000, "CE", "NIFTY", "NSE_FO|1", "NSE_FO", 65, 0.05)
-
-    def test_option_candle_requires_full_contract_identity(self):
-        candle = {"instrument_key": "NSE_FO|1", "expiry": "2026-09-10", "strike": 25000, "option_type": "CE"}
-        self.assertTrue(validate_option_candle_identity(candle, self.contract))
-        for field, value in (("instrument_key", "NSE_FO|2"), ("expiry", "2026-09-17"),
-                             ("strike", 25100), ("option_type", "PE")):
-            invalid = dict(candle)
-            invalid[field] = value
-            with self.assertRaisesRegex(ValueError, "OPTION_CANDLE_IDENTITY_MISMATCH"):
-                validate_option_candle_identity(invalid, self.contract)
-
-    def test_completed_option_candle_is_fresh_and_five_minute_aligned(self):
-        now = datetime(2026, 9, 10, 13, 35, tzinfo=ZoneInfo("Asia/Kolkata"))
-        row = ["2026-09-10T13:30:00+05:30", 100, 105, 99, 103, 10]
-        self.assertTrue(validate_option_candle(row, self.contract,
-                                               timestamp=datetime.fromisoformat(row[0]), now=now))
-        with self.assertRaisesRegex(ValueError, "OPTION_CANDLE_STALE"):
-            validate_option_candle(row, self.contract, timestamp=now - timedelta(minutes=11), now=now)
 
     def test_contract_and_tick_rounding(self):
         contract = OptionContract("NIFTY", "08SEP2026", 23900, "CE", "NIFTY08SEP2623900CE", "42635", "NFO", 65, 0.05)
@@ -100,6 +81,36 @@ class OptionResolutionTests(unittest.TestCase):
                                             underlying_key="NIFTY_KEY")
         self.assertLessEqual(len(selected), 5)
         self.assertTrue(all(abs(contract.strike - 25000) <= 100 for contract in selected))
+
+    def test_index_expiry_uses_current_applicable_expiry(self):
+        today = datetime.now(IST).date()
+        weekly = (today + timedelta(days=3)).isoformat()
+        next_weekly = (today + timedelta(days=10)).isoformat()
+        monthly = (today + timedelta(days=24)).isoformat()
+        records = [
+            {"segment": "NSE_FO", "instrument_type": "CE", "underlying_key": "NIFTY_KEY",
+             "expiry": next_weekly, "strike_price": 25000, "lot_size": 65, "tick_size": 0.05,
+             "trading_symbol": "NIFTY25000CE", "instrument_key": "NIFTY_WEEKLY_LATE"},
+            {"segment": "NSE_FO", "instrument_type": "CE", "underlying_key": "NIFTY_KEY",
+             "expiry": weekly, "strike_price": 25000, "lot_size": 65, "tick_size": 0.05,
+             "trading_symbol": "NIFTY25000CE", "instrument_key": "NIFTY_WEEKLY_CURRENT"},
+            {"segment": "NSE_FO", "instrument_type": "CE", "underlying_key": "BANKNIFTY_KEY",
+             "expiry": monthly, "strike_price": 50000, "lot_size": 15, "tick_size": 0.05,
+             "trading_symbol": "BANKNIFTY50000CE", "instrument_key": "BANKNIFTY_MONTHLY"},
+            {"segment": "BSE_FO", "instrument_type": "CE", "underlying_key": "SENSEX_KEY",
+             "expiry": next_weekly, "strike_price": 80000, "lot_size": 10, "tick_size": 0.05,
+             "trading_symbol": "SENSEX80000CE", "instrument_key": "SENSEX_WEEKLY_LATE"},
+            {"segment": "BSE_FO", "instrument_type": "CE", "underlying_key": "SENSEX_KEY",
+             "expiry": weekly, "strike_price": 80000, "lot_size": 10, "tick_size": 0.05,
+             "trading_symbol": "SENSEX80000CE", "instrument_key": "SENSEX_WEEKLY_CURRENT"},
+            {"segment": "NSE_FO", "instrument_type": "CE", "underlying_key": "MIDCPNIFTY_KEY",
+             "expiry": monthly, "strike_price": 25000, "lot_size": 50, "tick_size": 0.05,
+             "trading_symbol": "MIDCPNIFTY25000CE", "instrument_key": "MIDCPNIFTY_MONTHLY"},
+        ]
+        self.assertEqual(select_atm_option("NIFTY", "NSE_INDEX", 25000, "CALL", records, underlying_key="NIFTY_KEY").expiry, weekly)
+        self.assertEqual(select_atm_option("SENSEX", "BSE_INDEX", 80000, "CALL", records, underlying_key="SENSEX_KEY").expiry, weekly)
+        self.assertEqual(select_atm_option("BANKNIFTY", "NSE_INDEX", 50000, "CALL", records, underlying_key="BANKNIFTY_KEY").expiry, monthly)
+        self.assertEqual(select_atm_option("MIDCPNIFTY", "NSE_INDEX", 25000, "CALL", records, underlying_key="MIDCPNIFTY_KEY").expiry, monthly)
 
     def test_expired_contracts_are_rejected(self):
         expired = (datetime.now(IST).date() - timedelta(days=1)).isoformat()

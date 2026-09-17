@@ -4,6 +4,8 @@ import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from storage.retention import append_line
+import config
 
 
 class LiveBrokerValidationReport:
@@ -20,6 +22,6 @@ class LiveBrokerValidationReport:
             **values,
         }
         with self.lock:
-            with self.path.open("a", encoding="utf-8") as output:
-                output.write(json.dumps(record, default=str, sort_keys=True) + "\n")
+            append_line(self.path, json.dumps(record, default=str, sort_keys=True) + "\n",
+                        config.LOG_MAX_BYTES, config.LOG_BACKUP_COUNT)
         return record

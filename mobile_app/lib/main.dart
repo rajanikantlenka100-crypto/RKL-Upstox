@@ -177,6 +177,20 @@ class RklApi {
     return Map<String, dynamic>.from(decoded);
   }
 
+  Future<Map<String, dynamic>> observerSnapshot() async {
+    final response = await client
+        .get(Uri.parse('$apiBase/api/v1/observer/snapshot'), headers: _headers)
+        .timeout(const Duration(seconds: 12));
+    if (response.statusCode != 200) throw Exception('Observer API ${response.statusCode}: ${response.reasonPhrase}');
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map || decoded['protocol'] != 'rkl.observer.v1') {
+      throw const FormatException('Expected rkl.observer.v1 envelope');
+    }
+    final payload = decoded['payload'];
+    if (payload is! Map) throw const FormatException('Expected observer payload');
+    return Map<String, dynamic>.from(payload);
+  }
+
   WebSocketChannel stream() {
     final apiUri = Uri.parse(apiWsBase.isEmpty ? apiBase : apiWsBase);
     final isLocalHost = apiUri.host == '127.0.0.1' || apiUri.host == 'localhost' || apiUri.host == '10.0.2.2';
@@ -185,7 +199,7 @@ class RklApi {
         : apiUri;
     final socketBase = socketUri.replace(scheme: socketUri.scheme == 'https' ? 'wss' : 'ws');
     return IOWebSocketChannel.connect(
-      socketBase.replace(path: '${socketBase.path.replaceFirst(RegExp(r'/$'), '')}/api/v1/mobile/stream'),
+      socketBase.replace(path: '${socketBase.path.replaceFirst(RegExp(r'/$'), '')}/api/v1/observer/stream'),
       protocols: const [],
       headers: {'Authorization': 'Bearer $apiToken'},
       connectTimeout: const Duration(seconds: 8),
@@ -221,18 +235,21 @@ class _ControlCentreState extends State<ControlCentre> {
   Map<String, dynamic> orders = {};
   Map<String, dynamic> positions = {};
   Map<String, dynamic> options = {};
+  Map<String, dynamic> fills = {};
+  Map<String, dynamic> exits = {};
   Map<String, dynamic> notifications = {};
   Map<String, dynamic> reports = {};
+  Map<String, dynamic> canonical = {};
   Object? error;
   DateTime? updatedAt;
   int? lastSequence;
 
   static const _titles = [
     'Control Centre', 'Market', 'Index Data', 'Indicators', 'Options', 'Signals',
-    'Notifications', 'Orders', 'Positions', 'Reports', 'Sandbox', 'System Health', 'Settings',
+    'Notifications', 'Orders', 'Fills', 'Positions', 'Exits', 'Reports', 'Sandbox', 'System Health', 'Settings',
   ];
-  static const _bottomTabs = [0, 1, 5, 7, 8];
-  static const _icons = [Icons.dashboard_outlined, Icons.show_chart_rounded, Icons.table_chart_outlined, Icons.insights_outlined, Icons.grid_view_rounded, Icons.bolt_outlined, Icons.notifications_none_rounded, Icons.receipt_long_outlined, Icons.account_balance_wallet_outlined, Icons.assessment_outlined, Icons.science_outlined, Icons.health_and_safety_outlined, Icons.settings_outlined];
+  static const _bottomTabs = [0, 1, 5, 7, 9];
+  static const _icons = [Icons.dashboard_outlined, Icons.show_chart_rounded, Icons.table_chart_outlined, Icons.insights_outlined, Icons.grid_view_rounded, Icons.bolt_outlined, Icons.notifications_none_rounded, Icons.receipt_long_outlined, Icons.data_object_rounded, Icons.account_balance_wallet_outlined, Icons.exit_to_app_rounded, Icons.assessment_outlined, Icons.science_outlined, Icons.health_and_safety_outlined, Icons.settings_outlined];
 
   @override
   void initState() {
@@ -259,14 +276,10 @@ class _ControlCentreState extends State<ControlCentre> {
     if (refreshing) return;
     refreshing = true;
     try {
-      final values = await Future.wait([
-        api.get('status'), api.get('market'), api.get('signals'), api.get('orders'), api.get('positions'),
-        api.get('options'), api.get('notifications'), api.get('reports'),
-      ]);
+      final payload = await api.observerSnapshot();
       if (!mounted) return;
       setState(() {
-        status = values[0]; market = values[1]; signals = values[2]; orders = values[3];
-        positions = values[4]; options = values[5]; notifications = values[6]; reports = values[7];
+        _applyCanonical(payload);
         error = null; loading = false; updatedAt = DateTime.now();
       });
     } catch (exception) {
@@ -295,21 +308,49 @@ class _ControlCentreState extends State<ControlCentre> {
       final decoded = jsonDecode(message as String);
       if (decoded is! Map) return;
       final envelope = Map<String, dynamic>.from(decoded);
+      if (envelope['protocol'] != 'rkl.observer.v1') return;
+      if (envelope['event_type'] == 'WELCOME' || envelope['event_type'] == 'HEARTBEAT') return;
       final sequence = envelope['sequence'] as int?;
-      if (sequence != null && lastSequence != null && sequence != lastSequence! + 1) refresh();
+      if (sequence != null && lastSequence != null && sequence != lastSequence! + 1) {
+        lastSequence = null;
+        refresh();
+        return;
+      }
       lastSequence = sequence ?? lastSequence;
       final payload = envelope['payload'];
       if (!mounted || payload is! Map) return;
-      final next = Map<String, dynamic>.from(payload);
       setState(() {
+        _applyCanonical(Map<String, dynamic>.from(payload));
         streamConnected = true;
-        status = {...status, ...next}; market = {...market, ...next}; signals = {...signals, ...next};
-        orders = {...orders, ...next}; positions = {...positions, ...next}; options = {...options, ...next};
         updatedAt = DateTime.now(); error = null;
       });
     } catch (_) {
       // A malformed event should not take down the read-only display.
     }
+  }
+
+  void _applyCanonical(Map<String, dynamic> payload) {
+    canonical = payload;
+    final health = _map(payload['SystemHealth']);
+    final marketStatus = _map(payload['MarketStatus']);
+    final indexState = _map(payload['IndexState']);
+    final indicatorState = _map(payload['IndicatorState']);
+    final optionUniverse = _list(payload['OptionUniverse']);
+    status = {
+      'system_status': health['status'], 'execution_mode': health['execution_mode'],
+      'components': _map(health['components']), 'ws_status': health['ws_status'],
+      'startup_phase': health['startup_phase'], 'last_event': health['last_event'],
+      'reconnects': health['reconnects'], 'market_status': marketStatus['market_state'],
+    };
+    market = {'instrument_names': indexState.keys.toList(), 'IndexState': indexState, 'MarketStatus': marketStatus, 'market_status': marketStatus['market_state'], 'indicators': indicatorState};
+    signals = {'signal': payload['SignalState'], 'signal_history': const [], 'signal_queue': const []};
+    orders = {'orders': _list(payload['OrderState'])};
+    fills = {'fills': _list(payload['FillState'])};
+    positions = {'position_details': _list(payload['PositionState'])};
+    exits = {'exits': _list(payload['ExitState'])};
+    options = {'option_universe': {for (var index = 0; index < optionUniverse.length; index++) '$index': optionUniverse[index]}};
+    notifications = {'events': _list(payload['IncidentState'])};
+    reports = {'reports': payload['ReportSummary'] == null ? const [] : [payload['ReportSummary']]};
   }
 
   void _streamEnded() {
@@ -373,11 +414,13 @@ class _ControlCentreState extends State<ControlCentre> {
       case 5: return _listPage('Signals', signals['signal_history'], Icons.bolt_rounded);
       case 6: return _listPage('Notifications', notifications['events'], Icons.notifications_none_rounded);
       case 7: return _listPage('Orders', orders['orders'], Icons.receipt_long_rounded);
-      case 8: return _listPage('Positions', positions['position_details'], Icons.account_balance_wallet_outlined);
-      case 9: return _listPage('Reports', reports['reports'], Icons.assessment_outlined);
-      case 10: return _emptyPage('Sandbox', 'NO SANDBOX DATA', 'The read-only client has no sandbox execution surface.');
-      case 11: return _healthPage();
-      case 12: return _settingsPage();
+      case 8: return _listPage('Fills', fills['fills'], Icons.data_object_rounded);
+      case 9: return _listPage('Positions', positions['position_details'], Icons.account_balance_wallet_outlined);
+      case 10: return _listPage('Exits', exits['exits'], Icons.exit_to_app_rounded);
+      case 11: return _listPage('Reports', reports['reports'], Icons.assessment_outlined);
+      case 12: return _emptyPage('Sandbox', 'NO SANDBOX DATA', 'The read-only client has no sandbox execution surface.');
+      case 13: return _healthPage();
+      case 14: return _settingsPage();
       default: return _controlCentre();
     }
   }
@@ -512,22 +555,27 @@ class _ControlCentreState extends State<ControlCentre> {
   Widget _indexCards({bool compact = true}) {
     final instrumentNames = _list(market['instrument_names']);
     final names = instrumentNames.isEmpty ? ['NIFTY', 'BANKNIFTY', 'SENSEX', 'MIDCPNIFTY'] : instrumentNames;
-    final latest = _map(market['latest']);
-    final candles = _map(market['candles']);
+    final indexState = _map(market['IndexState']);
     return Column(children: names.map((rawName) {
       final name = rawName.toString();
-      final tick = _map(latest[name]);
-      final candle = _map(candles[name]);
-      final change = tick['change'] ?? tick['net_change'] ?? tick['change_percent'];
+      final index = _map(indexState[name]);
+      final tick = <String, dynamic>{
+        'ltp': index['ltp'], 'timestamp': index['timestamp'],
+        'exchange_timestamp': index['exchange_timestamp'],
+        'received_timestamp': index['received_timestamp'], 'source': index['source'],
+        'previous_candle': index['previous_candle'],
+      };
+      final candle = _map(index['current_candle']);
+      const change = null;
       return Padding(padding: const EdgeInsets.only(bottom: 8), child: _IndexCard(name: name, tick: tick, candle: candle, change: change, compact: compact, marketStatus: market['market_status']));
     }).toList());
   }
 
   Widget _indicatorCard(String name, Object? value) {
-    final values = value is List ? value : const [];
+    final data = _map(value);
     return Padding(padding: const EdgeInsets.only(bottom: 10), child: _TerminalCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Text(name, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)), const SizedBox(height: 12),
-      Row(children: [_ValueChip('RSI14', values.isNotEmpty ? values[0] : null), _ValueChip('RSI14 SMA', values.length > 1 ? values[1] : null), _ValueChip('CCI5', values.length > 2 ? values[2] : null)]),
+      Row(children: [_ValueChip('RSI14', data['rsi14']), _ValueChip('RSI14 SMA', data['rsi_sma5']), _ValueChip('CCI5', data['cci5'])]),
     ])));
   }
 
@@ -654,7 +702,7 @@ class _IndexCard extends StatelessWidget {
       const SizedBox(height: 8),
       Row(crossAxisAlignment: CrossAxisAlignment.end, children: [Text(_number(tick['ltp']), style: const TextStyle(fontSize: 25, fontWeight: FontWeight.w900, letterSpacing: -.5)), const SizedBox(width: 10), if (change != null) Text(_number(change, signed: true), style: TextStyle(color: positive == true ? _mint : positive == false ? Colors.redAccent : _muted, fontWeight: FontWeight.w800))]),
       const SizedBox(height: 9),
-      Wrap(spacing: 8, runSpacing: 6, children: [_ContextChip('5M', candle['close'] ?? candle['close_5m']), _ContextChip('3M', tick['close_3m'] ?? candle['close_3m']), _ContextChip('RSI14', tick['rsi14']), _ContextChip('CCI5', tick['cci5'])]),
+      Wrap(spacing: 8, runSpacing: 6, children: [_ContextChip('CURRENT 5 MIN', candle['close']), _ContextChip('LAST CLOSED 5 MIN', _map(_map(tick['previous_candle']))['close']), _ContextChip('RSI14', tick['rsi14']), _ContextChip('CCI5', tick['cci5'])]),
       if (!compact) ...[const SizedBox(height: 10), Text('SMA: ${tick['sma'] ?? tick['sma_info'] ?? 'UNKNOWN'}', style: const TextStyle(color: _muted, fontSize: 12))],
     ]));
   }

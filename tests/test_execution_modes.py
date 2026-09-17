@@ -56,11 +56,11 @@ class ExecutionModeTests(unittest.TestCase):
         service._periodic_sync = MagicMock()
         return service
 
-    def _assert_startup_preflight_does_not_open_gate(self, mode):
+    def _assert_startup_preflight_does_not_open_gate(self, mode, enable_real_orders):
         service = self._startup_preflight_service()
         result = PreflightResult(True, "2026-09-12T09:15:00+05:30")
         with patch("config.EXECUTION_MODE", mode), \
-             patch("config.ENABLE_REAL_ORDERS", True), \
+             patch("config.ENABLE_REAL_ORDERS", enable_real_orders), \
              patch("config.PREFLIGHT_PASSED", False), \
              patch("config.validate_runtime"), \
              patch("main.run_local_preflight", return_value=result), \
@@ -71,10 +71,10 @@ class ExecutionModeTests(unittest.TestCase):
             self.assertFalse(__import__("config").order_execution_enabled())
 
     def test_production_startup_preflight_pass_is_readiness_only(self):
-        self._assert_startup_preflight_does_not_open_gate("PRODUCTION")
+        self._assert_startup_preflight_does_not_open_gate("PRODUCTION", True)
 
     def test_sandbox_startup_preflight_pass_is_readiness_only(self):
-        self._assert_startup_preflight_does_not_open_gate("SANDBOX")
+        self._assert_startup_preflight_does_not_open_gate("SANDBOX", False)
 
     def test_production_preflight_pass_opens_execution_gate(self):
         result = PreflightResult(True, "2026-09-12T09:15:00+05:30")
@@ -101,12 +101,20 @@ class ExecutionModeTests(unittest.TestCase):
         result = PreflightResult(True, "2026-09-12T09:15:00+05:30")
         service, _ = self._preflight_service(result)
         with patch("config.EXECUTION_MODE", "SANDBOX"), \
-               patch("config.ENABLE_REAL_ORDERS", True), \
+               patch("config.ENABLE_REAL_ORDERS", False), \
              patch("config.PREFLIGHT_PASSED", False), \
              patch("main.run_local_preflight", return_value=result):
             service._try_activate_execution_preflight()
             self.assertTrue(__import__("config").PREFLIGHT_PASSED)
             self.assertTrue(__import__("config").order_execution_enabled())
+
+    def test_sandbox_requires_real_orders_disabled(self):
+        with patch("config.EXECUTION_MODE", "SANDBOX"), \
+             patch("config.ENABLE_REAL_ORDERS", True), \
+             patch("config.ORDER_ENV", "sandbox"), \
+             patch("config.PREFLIGHT_PASSED", True):
+            with self.assertRaisesRegex(RuntimeError, "SANDBOX requires REAL_ORDERS_ENABLED=OFF"):
+                __import__("config").validate_runtime()
 
     def test_read_only_and_backtest_cannot_execute_real_orders(self):
         for mode in ("READ_ONLY", "BACKTEST"):
@@ -160,6 +168,7 @@ class ExecutionModeTests(unittest.TestCase):
             db_path = Path(directory) / "production.sqlite3"
             with patch("config.EXECUTION_MODE", "PRODUCTION"), \
                  patch("config.ENABLE_REAL_ORDERS", False), \
+                 patch("config.LIVE_BROKER_VALIDATION_ENABLED", False), \
                  patch("config.ORDER_ENV", "live"), \
                  patch("config.AUTO_TRADING_ENABLED", True), \
                  patch("config.AUTO_ENTRY_ENABLED", True), \
@@ -203,6 +212,21 @@ class ExecutionModeTests(unittest.TestCase):
              patch("config.EXECUTION_MODE", "PRODUCTION"), \
              patch("config.PREFLIGHT_PASSED", True):
             self.assertFalse(__import__("config").order_execution_enabled())
+
+    def test_sandbox_ledger_starts_with_virtual_capital_and_persists_completed_trade_count(self):
+        from trading.sandbox_execution import SandboxLedger
+        path = Path(tempfile.mkdtemp()) / "sandbox_ledger.json"
+        ledger = SandboxLedger(path)
+        self.assertEqual(ledger.opening_capital, 200000)
+        self.assertEqual(ledger.available_capital, 200000)
+        self.assertEqual(ledger.completed_trades, 0)
+        ledger.record_completed_trade(100, 50, 10)
+        ledger.record_completed_trade(95, 45, 8)
+        self.assertEqual(ledger.completed_trades, 2)
+        self.assertEqual(ledger.realized_pnl, 195)
+        reloaded = SandboxLedger(path)
+        self.assertEqual(reloaded.completed_trades, 2)
+        self.assertEqual(reloaded.realized_pnl, 195)
 
     def test_database_rejects_execution_mode_reuse(self):
         with tempfile.TemporaryDirectory() as directory:

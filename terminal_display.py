@@ -34,6 +34,7 @@ class TerminalDisplay:
         self.indicator_base = {}
         self.indicator_updated = {}
         self.indicator_reason = {}
+        self.stochastic14 = {}
         self.last_candle_update = {}
         self.rest_status = {}
         self.health = {}
@@ -62,6 +63,7 @@ class TerminalDisplay:
         self.public_ip = "UNAVAILABLE"
         self.order_ip = "NOT CHECKED"
         self.preflight = {}
+        self.storage = {}
         self.lock = threading.Lock()
         self.render_lock = threading.Lock()
 
@@ -188,8 +190,13 @@ class TerminalDisplay:
                 "checked_at": result.checked_at,
                 "checks": dict(result.checks),
                 "failures": list(result.failures),
+                "reasons": dict(getattr(result, "reasons", {})),
                 "summary": result.summary,
             }
+
+    def set_storage_metrics(self, metrics):
+        with self.lock:
+            self.storage = dict(metrics)
 
     def set_previous(self, instrument, candle):
         with self.lock:
@@ -217,6 +224,10 @@ class TerminalDisplay:
             self.indicator_updated[instrument] = datetime.now(IST)
             self.indicator_reason[instrument] = reason or ("insufficient completed candles" if cci_value is None or rsi_value is None else "LIVE")
 
+    def set_stochastic(self, instrument, value):
+        with self.lock:
+            self.stochastic14[instrument] = value
+
     def set_rest_status(self, instrument, status):
         with self.lock:
             self.rest_status[instrument] = status
@@ -233,12 +244,29 @@ class TerminalDisplay:
             components = dict(self.components)
             if market_status == "CLOSED" and components.get("SIGNALS") == "READY":
                 components["SIGNALS"] = "BLOCKED-CLOSED"
+
+            pipeline_state = {
+                "market_data": "READY" if self.latest else "UNAVAILABLE",
+                "candle_engine": "HEALTHY" if self.candles else "UNAVAILABLE",
+                "indicators": "READY" if self.indicators else "UNAVAILABLE",
+                "strategy": "READY" if self.signal or self.signal_queue else "WAITING",
+                "signal": "READY" if self.signal else "WAITING",
+                "option": "ATM RESOLVED" if self.option_universe else "UNAVAILABLE",
+                "order": "NOT ACTIVE" if not self.orders else "ACTIVE",
+                "fill": "REPORTED" if self.orders else "UNAVAILABLE",
+                "position": "OPEN" if self.position_details else "NONE",
+                "exit": "MONITORING" if self.position_details else "IDLE",
+                "broker_close": "READY" if components.get("BROKER") == "READY" else "WAITING",
+                "reconciliation": "READY" if components.get("BROKER") == "READY" else "UNAVAILABLE",
+            }
+
             return {
                 "instrument_names": list(self.instruments),
                 "latest": dict(self.latest), "candles": dict(self.candles),
                 "option_quotes": dict(self.option_quotes),
                 "option_universe": dict(self.option_universe),
                 "prev2": dict(self.prev2), "previous": dict(self.previous), "indicators": dict(self.indicators),
+                "stochastic14": dict(self.stochastic14),
                 "indicator_base": dict(self.indicator_base), "indicator_updated": dict(self.indicator_updated),
                 "indicator_reason": dict(self.indicator_reason), "last_candle_update": dict(self.last_candle_update),
                 "rest_status": dict(self.rest_status), "health": dict(self.health),
@@ -255,6 +283,19 @@ class TerminalDisplay:
                 "market_status": market_status,
                 "execution_mode": config.EXECUTION_MODE,
                 "preflight": dict(self.preflight),
+                "storage": dict(self.storage),
+                "pipeline_state": pipeline_state,
+                "system_health": {
+                    "server_time_utc": datetime.now(IST).isoformat(),
+                    "execution_mode": config.EXECUTION_MODE,
+                    "real_orders_enabled": config.ENABLE_REAL_ORDERS,
+                    "market_open": market_status == "OPEN",
+                    "feed_connected": self.ws_status.upper() in {"CONNECTED", "LIVE", "READY"},
+                    "database_healthy": components.get("DATABASE") == "READY",
+                    "history_sync": "SYNCED" if all(status == "SYNCED" for status in self.rest_status.values()) else "WAITING",
+                    "preflight": "PASSED" if self.preflight.get("passed") else "FAILED",
+                    "status": "HEALTHY" if components.get("DATABASE") == "READY" else "DEGRADED",
+                },
             }
 
     def render_loop(self, stop_event, interval_seconds=None):

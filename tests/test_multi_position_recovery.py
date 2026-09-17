@@ -35,10 +35,10 @@ class MultiPositionRecoveryTests(unittest.TestCase):
             result = manager.reconcile()
             self.assertEqual(set(manager.positions), {"T1", "T2"})
             self.assertEqual(result["externally_closed"], {"T1"})
-            self.assertEqual(manager.positions["T1"].state, PositionState.CLOSED)
-            self.assertEqual(manager.positions["T1"].exit_reason, "EXTERNAL_MANUAL_EXIT")
-            self.assertEqual(manager.positions["T2"].state, PositionState.SL_ACTIVE)
-            self.assertEqual(manager.positions["T2"].initial_risk, 8)
+            self.assertEqual(manager.positions["T1"].state, PositionState.UNKNOWN)
+            self.assertEqual(manager.positions["T1"].exit_reason, "EXTERNAL_POSITION_UNRESOLVED")
+            self.assertEqual(manager.positions["T2"].state, PositionState.OPEN)
+            self.assertIsNotNone(manager.positions["T2"].strategy_exit)
             store.close()
 
 

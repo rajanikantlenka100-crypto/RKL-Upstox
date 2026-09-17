@@ -4,6 +4,8 @@ import json
 import threading
 from datetime import datetime
 from pathlib import Path
+from storage.retention import append_line
+import config
 
 
 class SignalAudit:
@@ -16,8 +18,8 @@ class SignalAudit:
         payload = dict(record)
         payload["updated_at"] = datetime.now().astimezone().isoformat()
         with self.lock:
-            with self.path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(payload, default=str) + "\n")
+            append_line(self.path, json.dumps(payload, default=str) + "\n",
+                        config.LOG_MAX_BYTES, config.LOG_BACKUP_COUNT)
 
     def report(self):
         if not self.path.exists():

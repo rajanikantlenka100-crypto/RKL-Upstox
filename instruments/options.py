@@ -36,40 +36,6 @@ def round_to_tick(price, tick_size):
     return float(steps * Decimal(str(tick_size)))
 
 
-def validate_option_candle_identity(candle, contract: OptionContract):
-    values = candle if isinstance(candle, dict) else candle.__dict__
-    if str(values.get("instrument_key", values.get("token"))) != contract.instrument_key:
-        raise ValueError("OPTION_CANDLE_IDENTITY_MISMATCH: instrument key")
-    if str(values.get("expiry")) != contract.expiry:
-        raise ValueError("OPTION_CANDLE_IDENTITY_MISMATCH: expiry")
-    try:
-        strike = float(values.get("strike"))
-    except (TypeError, ValueError):
-        raise ValueError("OPTION_CANDLE_IDENTITY_MISMATCH: strike") from None
-    if strike != contract.strike:
-        raise ValueError("OPTION_CANDLE_IDENTITY_MISMATCH: strike")
-    if str(values.get("option_type", "")).upper() != contract.option_type:
-        raise ValueError("OPTION_CANDLE_IDENTITY_MISMATCH: option type")
-    return True
-
-
-def validate_option_candle(row, contract: OptionContract, *, timestamp, now=None,
-                           timeframe="5m", max_age_seconds=600):
-    if timeframe != "5m":
-        raise ValueError("OPTION_CANDLE_TIMEFRAME_INVALID")
-    if timestamp.tzinfo is None:
-        raise ValueError("OPTION_CANDLE_TIMESTAMP_INVALID")
-    now = now or datetime.now(IST)
-    age = (now - timestamp.astimezone(IST)).total_seconds()
-    if age < 0 or age > max_age_seconds:
-        raise ValueError("OPTION_CANDLE_STALE")
-    if timestamp.astimezone(IST).minute % 5 != 0:
-        raise ValueError("OPTION_CANDLE_TIMEFRAME_INVALID")
-    if isinstance(row, dict) and row.get("status") == "RUNNING":
-        raise ValueError("OPTION_CANDLE_RUNNING")
-    return True
-
-
 def _expiry_date(value):
     try:
         epoch_milliseconds = float(value)
@@ -86,6 +52,13 @@ def _expiry_date(value):
         return datetime.strptime(str(value).upper(), "%d%b%Y").date()
 
 
+def current_expiry_for_underlying(underlying, rows):
+    valid_rows = [row for row in rows if row.get("expiry") and _expiry_date(row.get("expiry")) >= datetime.now(IST).date()]
+    if not valid_rows:
+        raise RuntimeError(f"No current option expiry for {underlying}")
+    return min(_expiry_date(row.get("expiry")) for row in valid_rows)
+
+
 def select_atm_option(underlying, exchange, ltp, direction, records=None, underlying_key=None,
                       occupied_tokens=None, quote_data=None, require_live_quote=False):
     records = records if records is not None else load_records()
@@ -97,12 +70,7 @@ def select_atm_option(underlying, exchange, ltp, direction, records=None, underl
         rows = [row for row in records if str(row.get("segment", "")).upper() == segment
             and str(row.get("instrument_type", "")).upper() in {"OPTIDX", "OPTSTK"}
             and str(row.get("name", "")).upper() in {underlying.upper(), f"{underlying.upper()} 50", "NIFTY 50", "NIFTY BANK"}]
-    today = datetime.now(IST).date()
-    expiries = sorted({_expiry_date(row.get("expiry")) for row in rows if row.get("expiry")})
-    valid_expiries = [expiry for expiry in expiries if expiry >= today]
-    if not valid_expiries:
-        raise RuntimeError(f"No current option expiry for {underlying}")
-    expiry = valid_expiries[0]
+    expiry = current_expiry_for_underlying(underlying, rows)
     rows = [row for row in rows if _expiry_date(row.get("expiry")) == expiry]
     target = round(ltp / config.STRIKE_INTERVALS[underlying]) * config.STRIKE_INTERVALS[underlying]
     suffix = "CE" if direction == "CALL" else "PE"
@@ -161,7 +129,7 @@ def select_candidate_options(underlying, exchange, ltp, direction, records=None,
             and row.get("expiry") and _expiry_date(row["expiry"]) >= today]
     if not rows:
         return []
-    expiry = min(_expiry_date(row["expiry"]) for row in rows)
+    expiry = current_expiry_for_underlying(underlying, rows)
     rows = [row for row in rows if _expiry_date(row["expiry"]) == expiry]
     step = config.STRIKE_INTERVALS[underlying]
     rows = sorted(rows, key=lambda row: abs(float(row.get("strike_price", row.get("strike", 0))) - target))

@@ -48,14 +48,13 @@ class SignalReplayTests(unittest.TestCase):
                 option = self.contract if option_type == "CE" else OptionContract(
                     "NIFTY", "08SEP2026", 23900, "PE", "NIFTY08SEP2623900PE", "42636", "NFO", 65, 0.05
                 )
-                summary = approval_summary(signal, option, 130.0, 120.0, 65)
+                summary = approval_summary(signal, option, 65)
                 self.assertEqual(summary["status"], "AUTO ENTRY PENDING")
                 gate = SafetyGate()
                 gate.running()
                 allowed, reason = gate.allow_buy(
                     feed_healthy=True, broker_authenticated=True, history_ready=True,
-                    contract_valid=True, option_ltp_fresh=True, risk_valid=True,
-                    signal_valid=True, database_ready=True,
+                    contract_valid=True, signal_valid=True, database_ready=True,
                 )
                 self.assertTrue(allowed, reason)
                 client = type("Broker", (), {"place_order": lambda _, params: {

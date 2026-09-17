@@ -13,28 +13,28 @@ import config
 from broker.upstox import UpstoxAdapter
 from broker.order_manager import BrokerOrderRejected, OrderExecutor
 from broker.validation_report import LiveBrokerValidationReport
-from instruments.options import (select_atm_option, select_candidate_options, validate_live_option_contract,
-                                  validate_option_candle, validate_option_candle_identity)
+from instruments.options import select_atm_option, select_candidate_options, validate_live_option_contract
 from instruments.resolver import resolve_indices
 from market_data.candles import CandleEngine
-from market_data.indicators import cci, rsi
+from market_data.indicators import cci, fast_stochastic, fast_stochastic_series, rsi, stochastic_entry_exception, validate_sma_trend
 from market_data.health import FeedHealth
 from market_data.historical import parse_historical_row
 from market_data.models import Candle, MarketTick
 from network_diagnostics import PublicIpError, order_ip_allowed, public_ipv4
-from signals.breakout import BreakoutEngine, Type2Engine
+from signals.breakout import BreakoutEngine, Type2Engine, Type3Engine
 from signals.rsi_filter import validate_rsi_entry
 from signals.audit import SignalAudit
 from signals.candidate_trace import CandidateTrace
 from storage.sqlite_store import CandleStore
+from storage.retention import append_line
 from observability import Observability
 from services.preflight import run_local_preflight
 from terminal_display import TerminalDisplay
 from web_dashboard import DashboardServer
 from signals.coordinator import ApprovalController, KeyboardController, SignalCoordinator
 from trading.approval import approval_summary
-from trading.positions import Position, PositionManager
-from trading.stop_loss_policy import build_stop_loss
+from trading.positions import Position, PositionManager, serialize_candle, serialize_strategy_exit_state
+from trading.sandbox_execution import SandboxOrderExecutor
 from trading.safety import SafetyGate, SystemState
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -49,6 +49,10 @@ class AuthenticationStartupBlocked(RuntimeError):
 
 
 class MarketDataService:
+    @staticmethod
+    def _contract_quantity(option):
+        return option["lot_size"] * config.LOT_COUNT
+
     def __init__(self):
         self.stop_event = threading.Event()
         self.instruments = resolve_indices()
@@ -56,13 +60,13 @@ class MarketDataService:
         self.observability = Observability(self.store)
         self.display = TerminalDisplay(self.instruments)
         self.engines = {name: CandleEngine(self._on_candle_closed) for name in self.instruments}
-        self.option_engines = {}
         self.option_contracts = {}
         self.option_centers = {}
         self.option_refresh_lock = threading.Lock()
         self.signal_trace = CandidateTrace(config.SIGNAL_TRACE_PATH, config.SIGNAL_TRACE_ENABLED, self._record_signal_candidate)
         self.breakouts = {name: BreakoutEngine(self.signal_trace.write) for name in self.instruments}
         self.type2_engines = {name: Type2Engine(self.signal_trace.write) for name in self.instruments}
+        self.type3_engines = {name: Type3Engine(self.signal_trace.write) for name in self.instruments}
         self.coordinator = SignalCoordinator(expiry_seconds=60)
         self.approval_controller = ApprovalController(self.coordinator, self._on_approval_decision)
         self.keyboard_controller = KeyboardController(self.approval_controller, self._on_keyboard_command)
@@ -83,8 +87,6 @@ class MarketDataService:
         self.reconciliation_blocked = set()
         self.recovery_lock = threading.Lock()
         self.public_ip = None
-        self.option_history_cache = {}
-        self.option_history_lock = threading.Lock()
         self.exit_lock = threading.Lock()
         self.websocket_started = False
         self.tick_count = 0
@@ -92,6 +94,7 @@ class MarketDataService:
         self.dashboard_started = False
         self.preflight_result = None
         self.stop_reason = None
+        self.last_storage_maintenance = 0.0
         self.lifecycle_log = config.ROOT / "logs" / "service_lifecycle.log"
         self.dashboard = DashboardServer(
             self.display, config.DASHBOARD_HOST, config.DASHBOARD_PORT,
@@ -101,9 +104,7 @@ class MarketDataService:
 
     def _lifecycle(self, message):
         line = f"{datetime.now(IST).isoformat()} {message}"
-        self.lifecycle_log.parent.mkdir(parents=True, exist_ok=True)
-        with self.lifecycle_log.open("a", encoding="utf-8") as log_file:
-            log_file.write(line + "\n")
+        append_line(self.lifecycle_log, line + "\n", config.LOG_MAX_BYTES, config.LOG_BACKUP_COUNT)
         if message.startswith(("[SERVICE] STOP", "[CRITICAL]", "[WS]")):
             print(message, flush=True)
 
@@ -201,8 +202,15 @@ class MarketDataService:
             self.display.add_event("⚠️ REAL BROKER ORDER EXECUTION ENABLED")
         else:
             self.display.add_event("REAL BROKER ORDER EXECUTION DISABLED")
-        self.order_manager = OrderExecutor(self.adapter.order_client)
-        self.position_manager = PositionManager(self.adapter.order_client)
+        if config.EXECUTION_MODE == "SANDBOX":
+            self.order_manager = SandboxOrderExecutor(
+                lambda token: self.display.snapshot().get("option_quotes", {}).get(token)
+            )
+            self.position_manager = PositionManager(self.order_manager)
+            self.display.add_event("SANDBOX EXECUTION ADAPTER ACTIVE | REAL UPSTOX ORDERS BLOCKED")
+        else:
+            self.order_manager = OrderExecutor(self.adapter.order_client)
+            self.position_manager = PositionManager(self.adapter.order_client)
         self.display.set_component("BROKER", "READY")
         print("DATABASE READY | BROKER READY", flush=True)
         if not startup_phase("POSITION RECONCILIATION", self._reconcile_positions):
@@ -226,12 +234,13 @@ class MarketDataService:
             position_manager=self.position_manager, order_manager=self.order_manager,
             public_ip=self.public_ip,
         )
-        config.set_preflight_passed(
-            self.preflight_result.passed and config.EXECUTION_MODE not in {"PRODUCTION", "SANDBOX"}
-        )
         self.display.set_preflight(self.preflight_result)
         self.display.set_component("PREFLIGHT", "READY" if self.preflight_result.passed else "FAILED")
         print(f"PRODUCTION PRE-FLIGHT: {self.preflight_result.summary}", flush=True)
+        for gate, passed in self.preflight_result.checks.items():
+            state = "PASS" if passed else "FAIL"
+            reason = self.preflight_result.reasons.get(gate, "")
+            print(f"[PREFLIGHT] {gate.upper()}: {state} {reason}", flush=True)
         if config.EXECUTION_MODE in {"PRODUCTION", "SANDBOX"} and not self.preflight_result.passed:
             self._halt_trading("Execution preflight failed: " + self.preflight_result.summary)
         self.adapter.start()
@@ -320,10 +329,8 @@ class MarketDataService:
             if self.stop_event.is_set():
                 return
             if tick.instrument not in self.instruments:
-                option_engine = self.option_engines.get(tick.token)
-                if option_engine is None:
+                if tick.token not in self.option_contracts:
                     return
-                option_engine.add(tick)
                 self.display.set_option_quote(tick.token, tick)
                 self._try_activate_execution_preflight()
                 return
@@ -347,6 +354,7 @@ class MarketDataService:
                 if current_bucket - previous_bucket > timedelta(minutes=config.TIMEFRAME_MINUTES):
                     self.breakouts[tick.instrument].reset_sequence()
                     self.type2_engines[tick.instrument].reset()
+                    self.type3_engines[tick.instrument].reset()
                     self.signals_enabled = False
                     self.recovery_required = True
                     self.safety.degrade(f"unsafe feed gap for {tick.instrument}")
@@ -390,6 +398,8 @@ class MarketDataService:
                             and self.health.can_signal(tick.instrument)
                             and tick.instrument not in self.reconciliation_blocked else None)
             if signal_event:
+                history = engine.history.get(tick.instrument, [])
+                sma_result = self._entry_sma_result(history, signal_event.direction)
                 rsi_result = validate_rsi_entry(
                     engine.history.get(tick.instrument, []),
                     signal_event.direction,
@@ -407,32 +417,46 @@ class MarketDataService:
                     rsi_first_matching_timestamp=(rsi_result.matching_candle_timestamps[0]
                                                    if rsi_result.matching_candle_timestamps else None),
                     rsi_reason=rsi_result.reason,
+                    sma_filter_status=sma_result["result"],
+                    sma_values=sma_result.get("values"),
+                    sma_reason=sma_result["reason"],
+                    entry_filter=sma_result["entry_filter"],
+                    stochastic_values=sma_result["stochastic_values"],
                 )
-                if rsi_result.result == "PASS":
+                if self._entry_filters_pass(rsi_result, sma_result):
                     self.signal_trace.write({
-                        "stage": "RSI_FILTER", "reason_code": "RSI_PASS",
+                        "stage": "ENTRY_FILTERS", "reason_code": "SMA_RSI_PASS",
                         "signal_id": signal_event.signal_id, "underlying": signal_event.underlying,
                         "direction": signal_event.direction, "matching_periods": rsi_result.matching_periods,
+                        "entry_filter": signal_event.entry_filter,
+                        "stochastic_values": signal_event.stochastic_values,
                     })
                     self._show_signal(signal_event)
                 else:
                     self.signal_trace.write({
-                        "stage": "RSI_FILTER", "reason_code": "RSI_" + rsi_result.result,
+                        "stage": "ENTRY_FILTERS", "reason_code": "SMA_" + sma_result["result"] if sma_result["result"] != "PASS" else "RSI_" + rsi_result.result,
                         "signal_id": signal_event.signal_id, "underlying": signal_event.underlying,
                         "direction": signal_event.direction, "matching_periods": rsi_result.matching_periods,
-                        "reason": rsi_result.reason,
+                        "sma_reason": sma_result["reason"], "rsi_reason": rsi_result.reason,
+                        "stochastic_values": sma_result["stochastic_values"],
                     })
-                    self._record_event("RSI_FILTER_" + rsi_result.result, {
+                    self._record_event("ENTRY_FILTERS_BLOCKED", {
                         "signal_id": signal_event.signal_id,
                         "direction": signal_event.direction,
                         "matching_periods": rsi_result.matching_periods,
                         "evaluated_periods": [timestamp.isoformat() for timestamp in rsi_result.evaluated_candle_timestamps],
                         "evaluated_rsi_values": rsi_result.evaluated_rsi_values,
                         "evaluated_sma_values": rsi_result.evaluated_sma_values,
+                        "sma_filter_status": sma_result["result"],
+                        "sma_values": sma_result.get("values"),
+                        "sma_reason": sma_result["reason"],
                         "reason": rsi_result.reason,
                     }, "signal_events")
                     self.signal_audit.write(self._audit_record(signal_event, {
-                        "status": "RSI_" + rsi_result.result,
+                        "status": "ENTRY_FILTERS_BLOCKED",
+                        "sma_filter_status": sma_result["result"],
+                        "sma_values": sma_result.get("values"),
+                        "sma_reason": sma_result["reason"],
                         "rsi_filter_status": rsi_result.result,
                         "rsi_matching_periods": rsi_result.matching_periods,
                         "rsi_evaluated_periods": [timestamp.isoformat() for timestamp in rsi_result.evaluated_candle_timestamps],
@@ -451,11 +475,12 @@ class MarketDataService:
                         history, direction, config.RSI_PERIOD,
                         config.RSI_SMA_PERIOD, config.RSI_LOOKBACK_PERIODS,
                     )
+                    type2_sma = self._entry_sma_result(history, direction)
                     type2_event = self.type2_engines[tick.instrument].evaluate(
                         prev2, previous, current, tick.ltp, direction=direction,
-                        rsi_pass=type2_rsi.result == "PASS",
+                        rsi_pass=self._entry_filters_pass(type2_rsi, type2_sma),
                     )
-                    if type2_event and type2_rsi.result == "PASS":
+                    if type2_event and self._entry_filters_pass(type2_rsi, type2_sma):
                         type2_event = replace(
                             type2_event,
                             rsi_filter_status=type2_rsi.result,
@@ -466,8 +491,46 @@ class MarketDataService:
                             rsi_first_matching_timestamp=(type2_rsi.matching_candle_timestamps[0]
                                                            if type2_rsi.matching_candle_timestamps else None),
                             rsi_reason=type2_rsi.reason,
+                            sma_filter_status=type2_sma["result"],
+                            sma_values=type2_sma.get("values"),
+                            sma_reason=type2_sma["reason"],
+                            entry_filter=type2_sma["entry_filter"],
+                            stochastic_values=type2_sma["stochastic_values"],
                         )
                         self._show_signal(type2_event)
+            if (config.SIGNAL_TYPE_3_ENABLED and self.signals_enabled and self.trading_state == SystemState.RUNNING
+                    and self.health.can_signal(tick.instrument)
+                    and tick.instrument not in self.reconciliation_blocked and current):
+                history = engine.history.get(tick.instrument, [])
+                prev2 = engine.prev2.get(tick.instrument)
+                for direction in ("CALL", "PUT"):
+                    type3_rsi = validate_rsi_entry(
+                        history, direction, config.RSI_PERIOD,
+                        config.RSI_SMA_PERIOD, config.RSI_LOOKBACK_PERIODS,
+                    )
+                    type3_sma = self._entry_sma_result(history, direction)
+                    type3_event = self.type3_engines[tick.instrument].evaluate(
+                        prev2, previous, current, tick.ltp, direction=direction,
+                        rsi_pass=type3_rsi.result == "PASS",
+                        sma_pass=type3_sma["result"] == "PASS",
+                    )
+                    if type3_event and self._entry_filters_pass(type3_rsi, type3_sma):
+                        self._show_signal(replace(
+                            type3_event,
+                            rsi_filter_status=type3_rsi.result,
+                            rsi_matching_periods=type3_rsi.matching_periods,
+                            rsi_evaluated_periods=type3_rsi.evaluated_candle_timestamps,
+                            rsi_evaluated_values=type3_rsi.evaluated_rsi_values,
+                            rsi_evaluated_sma_values=type3_rsi.evaluated_sma_values,
+                            rsi_first_matching_timestamp=(type3_rsi.matching_candle_timestamps[0]
+                                                           if type3_rsi.matching_candle_timestamps else None),
+                            rsi_reason=type3_rsi.reason,
+                            sma_filter_status=type3_sma["result"],
+                            sma_values=type3_sma.get("values"),
+                            sma_reason=type3_sma["reason"],
+                            entry_filter=type3_sma["entry_filter"],
+                            stochastic_values=type3_sma["stochastic_values"],
+                        ))
         except (KeyError, ValueError) as error:
             self._on_status(f"INVALID MARKET DATA: {error}")
         except Exception as error:
@@ -490,6 +553,34 @@ class MarketDataService:
         config.set_preflight_passed(True)
         self.display.set_component("PREFLIGHT", "READY")
         self.display.add_event("PRODUCTION PRE-FLIGHT PASS | REAL ORDER GATE OPEN")
+
+    @staticmethod
+    def _entry_sma_result(history, direction):
+        result = validate_sma_trend(history, direction)
+        exception = stochastic_entry_exception(history, direction)
+        result = dict(result)
+        result["stochastic_values"] = exception["values"]
+        result["stochastic_exception"] = exception["allowed"]
+        if result["result"] == "PASS":
+            result["entry_filter"] = "sma_normal"
+            return result
+        opposite_trend = (
+            direction == "CALL" and result["reason"].startswith("CALL blocked")
+        ) or (
+            direction == "PUT" and result["reason"].startswith("PUT blocked")
+        )
+        if opposite_trend and exception["allowed"]:
+            result["result"] = "PASS"
+            result["reason"] = "STOCHASTIC_EXCEPTION"
+            result["entry_filter"] = "stochastic_exception"
+        else:
+            result["entry_filter"] = "unavailable" if result["result"] == "UNAVAILABLE" else "sma_normal"
+        return result
+
+    @staticmethod
+    def _entry_filters_pass(rsi_result, sma_result):
+        """Use one finalized-candle admission decision for every signal type."""
+        return rsi_result.result == "PASS" and sma_result["result"] == "PASS"
 
     def _on_candle_closed(self, candle):
         try:
@@ -521,16 +612,12 @@ class MarketDataService:
         self.display.set_indicators(candle.instrument, cci_value, rsi_value, candle.timestamp)
         candles_before_close = self.engines[candle.instrument].history[candle.instrument]
         prior_candle = candles_before_close[-2] if len(candles_before_close) >= 2 else None
-        self._evaluate_closed_exits(candle, prior_candle, cci_value)
+        stochastic_values = fast_stochastic_series(candles, 14)
+        stochastic_value = stochastic_values[-1] if stochastic_values else None
+        previous_stochastic = stochastic_values[-2] if len(stochastic_values) > 1 else None
+        self.display.set_stochastic(candle.instrument, stochastic_value)
+        self._evaluate_closed_exits(candle, prior_candle, cci_value, stochastic_value, previous_stochastic)
         self.display.set_status(f"🕯️ 5M CANDLE CLOSED {candle.instrument} {candle.timestamp:%H:%M}")
-
-    def _on_option_candle_closed(self, candle):
-        try:
-            self.store.reconcile(candle)
-        except Exception as error:
-            self._record_event("OPTION_CANDLE_PERSISTENCE_FAILED", {
-                "instrument_key": candle.token, "reason": str(error),
-            })
 
     def _initialize_option_universe(self, names=None, underlying_prices=None):
         names = tuple(names or self.instruments)
@@ -542,11 +629,14 @@ class MarketDataService:
             try:
                 rows = self.adapter.option_contracts(instrument.token)
                 selected = []
+                self.option_priority[name] = {"CALL": [], "PUT": []}
                 for direction in ("CALL", "PUT"):
-                    selected.extend(select_candidate_options(
+                    candidates = select_candidate_options(
                         name, instrument.exchange, underlying_ltp, direction, rows,
                         underlying_key=instrument.token, count=5,
-                    ))
+                    )
+                    selected.extend(candidates)
+                    self.option_priority[name][direction] = candidates[:2]
                 for contract in selected:
                     if contract.instrument_key in self.option_contracts:
                         continue
@@ -555,23 +645,6 @@ class MarketDataService:
                         contract.exchange, 2 if contract.exchange == "NSE_FO" else 4,
                     )
                     self.option_contracts[contract.instrument_key] = contract
-                    engine = CandleEngine(self._on_option_candle_closed)
-                    try:
-                        option_candles = []
-                        for row in self.adapter.fetch_historical(option_instrument, count=10):
-                            timestamp, open_price, high, low, close, volume = parse_historical_row(row)
-                            if timestamp + timedelta(minutes=config.TIMEFRAME_MINUTES) > datetime.now(IST):
-                                continue
-                            candle = Candle(contract.instrument_key, contract.exchange, contract.instrument_key,
-                                            timestamp, "5m", open_price, high, low, close, volume, "HISTORICAL")
-                            self.store.reconcile(candle)
-                            option_candles.append(candle)
-                        engine.seed(option_candles)
-                    except Exception as error:
-                        self._record_event("OPTION_HISTORY_UNAVAILABLE", {
-                            "instrument_key": contract.instrument_key, "reason": str(error),
-                        })
-                    self.option_engines[contract.instrument_key] = engine
                     tracked.append(option_instrument)
             except Exception as error:
                 self._record_event("OPTION_UNIVERSE_UNAVAILABLE", {
@@ -600,53 +673,82 @@ class MarketDataService:
             return
         with self.position_manager.lock:
             positions = [position for position in self.position_manager.positions.values()
-                         if position.underlying == instrument and position.state in {"OPEN", "SL_ACTIVE"}]
+                         if position.underlying == instrument and position.state == "OPEN"]
+        closed_candles = tuple(self.engines[instrument].history.get(instrument, []))
+        cci_candles = list(closed_candles) + [running]
+        running_cci = cci(cci_candles, config.CCI_PERIOD)
         for position in positions:
             if not position.strategy_exit:
                 continue
-            reason = position.strategy_exit.on_running_candle(running)
+            before_exit_state = serialize_strategy_exit_state(position.strategy_exit)
+            previous = self.engines[instrument].context(instrument)["previous"]
+            with self.position_manager.lock:
+                if position.state != "OPEN":
+                    continue
+                reason = position.strategy_exit.on_running_candle(
+                    running,
+                    previous_candle=previous,
+                    cci_value=running_cci,
+                    closed_candles=closed_candles,
+                )
             if not reason:
+                if before_exit_state != serialize_strategy_exit_state(position.strategy_exit):
+                    self._persist_position(position)
                 continue
-            position.five_r_state = "HIT"
-            position.exit_reason = reason
-            self._record_event("FIVE_R_EXIT_TRIGGERED", {
+            reserved = self.position_manager.reserve_exit(position.trade_id, reason)
+            if not reserved:
+                continue
+            self._persist_position(reserved)
+            self._record_event("INDEX_EXIT_TRIGGERED", {
                 "trade_id": position.trade_id, "instrument": instrument,
-                "initial_risk": position.initial_risk, "five_r": position.strategy_exit.five_r,
-                "running_range": running.high - running.low,
+                "reason": reason, "running_range": running.high - running.low,
+                "previous_range": previous.high - previous.low if previous else None,
             }, "position_events")
-            self.display.add_event(f"{position.trade_id} 5R EXIT TRIGGERED")
-            threading.Thread(target=self._execute_exit, args=(position.trade_id,),
-                             name="five-r-exit", daemon=True).start()
+            self.display.add_event(f"{position.trade_id} INDEX EXIT TRIGGERED: {reason}")
+            threading.Thread(target=self._execute_exit, args=(reserved.trade_id,),
+                             name="index-exit", daemon=True).start()
 
-    def _evaluate_closed_exits(self, candle, previous_candle, cci_value):
+    def _evaluate_closed_exits(self, candle, previous_candle, cci_value, stochastic_value=None, previous_stochastic=None):
         if not self.position_manager:
             return
         with self.position_manager.lock:
             positions = [position for position in self.position_manager.positions.values()
-                         if position.underlying == candle.instrument and position.state in {"OPEN", "SL_ACTIVE"}]
+                         if position.underlying == candle.instrument and position.state == "OPEN"]
         for position in positions:
             if not position.strategy_exit:
                 continue
             before = position.strategy_exit.cci_state
-            reason = position.strategy_exit.on_closed_candle(candle, previous_candle, cci_value)
+            before_exit_state = serialize_strategy_exit_state(position.strategy_exit)
+            with self.position_manager.lock:
+                if position.state != "OPEN":
+                    continue
+                reason = position.strategy_exit.on_closed_candle_with_stochastic(
+                    candle, previous_candle, cci_value, stochastic_value, previous_stochastic,
+                )
             position.cci_exit_state = position.strategy_exit.cci_state
-            if before != position.cci_exit_state:
+            if before != position.cci_exit_state or before_exit_state != serialize_strategy_exit_state(position.strategy_exit):
+                self._persist_position(position)
                 self._record_event("CCI_EXIT_ARMED", {
                     "trade_id": position.trade_id, "instrument": candle.instrument,
                     "cci": cci_value, "candle_timestamp": candle.timestamp.isoformat(),
                 }, "position_events")
                 self.display.add_event(f"{position.trade_id} CALL/PUT EXIT {position.cci_exit_state}")
             if reason:
-                position.exit_reason = reason
+                reserved = self.position_manager.reserve_exit(position.trade_id, reason)
+                if not reserved:
+                    continue
+                self._persist_position(reserved)
                 self._record_event("CCI_EXIT_CONFIRMED", {
                     "trade_id": position.trade_id, "instrument": candle.instrument,
                     "confirmation_candle": candle.timestamp.isoformat(),
                 }, "position_events")
-                threading.Thread(target=self._execute_exit, args=(position.trade_id,),
+                threading.Thread(target=self._execute_exit, args=(reserved.trade_id,),
                                  name="cci-exit", daemon=True).start()
 
     def _on_raw_market_event(self, event):
         if self.stop_event.is_set():
+            return
+        if not config.RAW_MARKET_EVENTS_ENABLED:
             return
         try:
             self.store.record_market_event(event["event_id"], event)
@@ -782,7 +884,8 @@ class MarketDataService:
                 if self.public_ip not in registered_ips:
                     allowed = False
                     reason = "PUBLIC IP DOES NOT MATCH UPSTOX REGISTERED STATIC IP"
-            self.display.set_network(self.public_ip, "MATCH" if allowed else "NOT WHITELISTED")
+            registered_label = ",".join(sorted(registered_ips)) if config.ENABLE_REAL_ORDERS else "NOT CHECKED"
+            self.display.set_network(self.public_ip, f"{reason}; configured={config.ORDER_IP_WHITELIST}; registered={registered_label}")
             if not allowed:
                 self.display.set_component("ORDERS", "IP BLOCKED")
                 if config.ENABLE_REAL_ORDERS:
@@ -995,6 +1098,31 @@ class MarketDataService:
                 "last_tick_timestamp": self.last_tick_timestamp.isoformat() if self.last_tick_timestamp else None,
                 "feed_health": {name: self.health.diagnostics(name) for name in self.instruments},
             })
+            now_monotonic = time.monotonic()
+            if now_monotonic - self.last_storage_maintenance >= config.STORAGE_MAINTENANCE_INTERVAL_SECONDS:
+                try:
+                    self.store.maintenance(
+                        raw_market_retention_days=config.RAW_MARKET_RETENTION_DAYS,
+                        telemetry_retention_days=config.TELEMETRY_RETENTION_DAYS,
+                        raw_market_max_rows=config.RAW_MARKET_MAX_ROWS,
+                        telemetry_max_rows=config.TELEMETRY_MAX_ROWS,
+                    )
+                    metrics = self.store.storage_metrics()
+                    self.display.set_storage_metrics(metrics)
+                    self.observability.event("STORAGE_MAINTENANCE", component="SYSTEM", payload=metrics, resolution="OBSERVED")
+                    if metrics["database_bytes"] >= config.STORAGE_WARNING_BYTES:
+                        self._record_event("STORAGE_WARNING", {
+                            "database_bytes": metrics["database_bytes"],
+                            "wal_bytes": metrics["wal_bytes"],
+                            "shm_bytes": metrics["shm_bytes"],
+                            "warning_bytes": config.STORAGE_WARNING_BYTES,
+                            "hard_limit_bytes": config.STORAGE_HARD_LIMIT_BYTES,
+                        })
+                    if metrics["database_bytes"] >= config.STORAGE_HARD_LIMIT_BYTES:
+                        self._halt_trading("SQLite database exceeded configured hard storage limit")
+                    self.last_storage_maintenance = now_monotonic
+                except Exception as error:
+                    self._halt_trading(f"Storage maintenance failed: {error}")
             if (datetime.now(IST) - last_reconciliation).total_seconds() < config.REST_SYNC_INTERVAL_SECONDS:
                 continue
             last_reconciliation = datetime.now(IST)
@@ -1042,12 +1170,27 @@ class MarketDataService:
             "status": "OPTION DATA PENDING",
             "signal_id": signal_event.signal_id, "priority": "PRIMARY" if signal_event.underlying in {"NIFTY", "SENSEX"} else "SECONDARY",
             "type2_conditions": signal_event.type2_conditions,
+            "entry_filter": signal_event.entry_filter,
+            "stochastic_values": signal_event.stochastic_values,
             "created_at": created_at.isoformat(), "expires_at": expires_at.isoformat(),
         })
         self.display.add_event(f"SIGNAL #{signal_event.signal_id[:8]} {signal_event.underlying} {signal_event.direction} | OPTION DATA PENDING")
         self._publish_signal_queue()
         threading.Thread(target=self._resolve_signal_option, args=(signal_event, created_at, expires_at),
                      name="option-resolution", daemon=True).start()
+
+    def _select_priority_option(self, underlying, direction):
+        occupied_tokens = {
+            str(token)
+            for token in (self.position_manager.active_tokens() if self.position_manager else set())
+        }
+        candidates = self.option_priority.get(underlying, {}).get(direction, [])
+
+        for priority, contract in enumerate(candidates[:2], start=1):
+            if str(contract.instrument_key) not in occupied_tokens:
+                return contract, priority
+
+        return None, None
 
     def _resolve_signal_option(self, signal_event, created_at, expires_at):
         try:
@@ -1057,106 +1200,43 @@ class MarketDataService:
                 queued = any(item["signal"].signal_id == signal_event.signal_id for item in self.coordinator.pending)
             if not active and not queued:
                 return
-            underlying_instrument = self.instruments[signal_event.underlying]
-            option_rows = self.adapter.option_contracts(underlying_instrument.token)
-            occupied_tokens = self.position_manager.active_tokens() if self.position_manager else set()
-            option_quotes = {
-                token: {"ltp": quote.ltp, "volume": quote.volume,
-                        "timestamp": quote.timestamp,
-                        "fresh": (datetime.now(IST) - quote.timestamp.astimezone(IST)).total_seconds() <= config.STALE_DATA_SECONDS}
-                for token, quote in self.display.snapshot().get("option_quotes", {}).items()
-            }
-            option = select_atm_option(signal_event.underlying, underlying_instrument.exchange,
-                                       signal_event.ltp, signal_event.direction, option_rows,
-                                       underlying_key=underlying_instrument.token,
-                                       occupied_tokens=occupied_tokens, quote_data=option_quotes,
-                                       require_live_quote=True)
-            option_instrument = self.instruments[signal_event.underlying].__class__(
-                signal_event.underlying, option["symbol"], option["token"], option["exchange"],
-                2 if option["exchange"] == "NFO" else 4
+            option, option_priority = self._select_priority_option(
+                signal_event.underlying,
+                signal_event.direction,
             )
-            live_quote = option_quotes.get(option["token"])
-            if not live_quote or (datetime.now(IST) - live_quote["timestamp"].astimezone(IST)).total_seconds() > config.STALE_DATA_SECONDS:
-                raise RuntimeError("OPTION_LTP_MISSING_OR_STALE")
-            option_quote = {"ltp": live_quote["ltp"], "timestamp": live_quote["timestamp"],
-                            "instrument_key": option["token"]}
-            option_ltp = option_quote["ltp"]
-            if option_quote["instrument_key"] != option["token"]:
-                raise RuntimeError("OPTION_LTP_IDENTITY_MISMATCH")
-            if option_quote["timestamp"] is None:
-                raise RuntimeError("OPTION_LTP_TIMESTAMP_MISSING")
-            if (datetime.now(IST) - option_quote["timestamp"].astimezone(IST)).total_seconds() > config.STALE_DATA_SECONDS:
-                raise RuntimeError("OPTION_LTP_STALE")
-            cache_key = option["token"]
-            with self.option_history_lock:
-                cached = self.option_history_cache.get(cache_key)
-            live_context = self.option_engines.get(option["token"])
-            live_previous = live_context.context(option["token"])["previous"] if live_context else None
-            if live_previous is not None:
-                option_rows = [[live_previous.timestamp.isoformat(), live_previous.open,
-                                 live_previous.high, live_previous.low, live_previous.close,
-                                 live_previous.volume]]
-            elif cached and (datetime.now(IST) - cached[0]).total_seconds() < 60:
-                option_rows = cached[1]
-            else:
-                option_rows = self.adapter.fetch_historical(option_instrument, count=2)
-                with self.option_history_lock:
-                    self.option_history_cache[cache_key] = (datetime.now(IST), option_rows)
-            if len(option_rows) < 1:
-                raise RuntimeError("Insufficient real option history for SL")
-            if live_previous is not None:
-                option_rows = [option_rows[0], option_rows[0]]
-            option_previous = option_rows[-2]
-            option_timestamp, option_open, option_high, option_low, option_close, option_volume = parse_historical_row(option_previous)
-            option_candle = {
-                "instrument_key": option["token"],
-                "expiry": option["expiry"],
-                "strike": option["strike"],
-                "option_type": option["option_type"],
-            }
-            validate_option_candle_identity(option_candle, option)
-            validate_option_candle(option_previous, option, timestamp=option_timestamp)
-            option_previous_low = option_low
+            if option is None:
+                raise RuntimeError(
+                    f"No available priority option for "
+                    f"{signal_event.underlying} {signal_event.direction}"
+                )
             self.display.set_signal({
                 "signal_type": signal_event.signal_type, "direction": signal_event.direction, "underlying": signal_event.underlying,
                 "ltp": f"{signal_event.ltp:.2f}", "breakout": f"{signal_event.breakout_price:.2f}",
                 "expiry": option["expiry"], "strike": option["strike"], "option": option["symbol"],
-                "option_ltp": f"{option_ltp:.2f}", "option_ohlc": option_previous[1:5],
-                "sl": f"{option_previous_low - config.SL_BUFFER:.2f}", "quantity": option["lot_size"],
-                "capital": f"{option_ltp * option['lot_size']:.2f}",
-                "risk": f"{max(0.0, (option_ltp - option_previous_low + config.SL_BUFFER) * option['lot_size']):.2f}",
+                "quantity": self._contract_quantity(option),
                 "status": "AUTO ENTRY PENDING" if config.AUTO_ENTRY_ENABLED else "APPROVAL REQUIRED",
             })
-            self.pending_signals[signal_event.signal_id] = (signal_event, option, option_ltp, option_previous_low)
-            self.display.set_signal({**approval_summary(signal_event, option, option_ltp, option_previous_low, option["lot_size"]),
+            self.pending_signals[signal_event.signal_id] = (signal_event, option)
+            quantity = self._contract_quantity(option)
+            self.display.set_signal({**approval_summary(signal_event, option, quantity),
                                      "signal_id": signal_event.signal_id, "priority": "PRIMARY" if signal_event.underlying in {"NIFTY", "SENSEX"} else "SECONDARY",
                                      "signal_type": signal_event.signal_type,
                                      "type2_conditions": signal_event.type2_conditions,
-                                     "created_at": created_at.isoformat(), "expires_at": expires_at.isoformat(),
-                                     "option_ohlc": option_previous[1:5]})
-            self.display.add_event(f"OPTION READY {option['symbol']} | SL:{option_previous_low - config.SL_BUFFER:.2f} | QTY:{option['lot_size']}")
+                                     "entry_filter": signal_event.entry_filter,
+                                     "stochastic_values": signal_event.stochastic_values,
+                                     "created_at": created_at.isoformat(), "expires_at": expires_at.isoformat()})
+            self.display.add_event(f"OPTION READY {option['symbol']} | QTY:{quantity}")
             self._validation_record({
                 "event": "OPTION_RESOLVED", "signal_id": signal_event.signal_id,
                 "symbol": option["symbol"], "token": option["token"],
                 "expiry": option["expiry"], "strike": option["strike"],
-                "option_type": option["option_type"], "option_ltp": option_ltp,
-                "option_ltp_timestamp": option_quote["timestamp"].isoformat(),
-                "option_candle_timestamp": option_timestamp.isoformat(),
-                "option_candle_ohlc": [option_open, option_high, option_low, option_close],
-                "option_candle_identity": option_candle,
-                "sl": option_previous_low - config.SL_BUFFER, "lot_size": option["lot_size"],
-                "quantity": option["lot_size"], "data_classification": "REAL BROKER DATA",
+                "option_type": option["option_type"], "lot_size": option["lot_size"],
+                "quantity": quantity, "data_classification": "REAL BROKER DATA",
             })
             self.signal_audit.write(self._audit_record(signal_event, {
                 "status": "WAITING", "approval": "PENDING", "created_at": created_at.isoformat(),
                 "expires_at": expires_at.isoformat(), "option_symbol": option["symbol"],
-                "option_token": option["token"], "option_ltp": option_ltp,
-                "option_ltp_timestamp": option_quote["timestamp"].isoformat(),
-                "option_candle_timestamp": option_timestamp.isoformat(),
-                "option_candle_ohlc": [option_open, option_high, option_low, option_close],
-                "option_candle_identity": option_candle,
-                "sl": option_previous_low - config.SL_BUFFER, "quantity": option["lot_size"],
-                "risk": max(0.0, (option_ltp - option_previous_low + config.SL_BUFFER) * option["lot_size"]),
+                "option_token": option["token"], "quantity": quantity,
             }))
             if config.AUTO_ENTRY_ENABLED:
                 resolved = self.coordinator.resolve(signal_event.signal_id, "AUTO_ENTRY")
@@ -1197,7 +1277,8 @@ class MarketDataService:
             self.display.clear_signal(f"Signal {resolved['status'].lower()}")
             self._publish_signal_queue()
             return
-        signal_event, option, option_ltp, option_previous_low = payload
+        signal_event, option = payload
+        quantity = self._contract_quantity(option)
         if not config.ENABLE_REAL_ORDERS:
             self.pending_signals.pop(signal_id, None)
             self.display.set_signal({
@@ -1208,12 +1289,12 @@ class MarketDataService:
             self.display.add_event(f"PAPER ENTRY {option['symbol']} | REAL ORDER DISABLED")
             self._record_event("PAPER_ENTRY", {
                 "signal_id": signal_id, "symbol": option["symbol"],
-                "quantity": option["lot_size"], "option_ltp": option_ltp,
+                "quantity": quantity,
             }, "orders")
             self._publish_signal_queue()
             return
         threading.Thread(target=self._execute_approved_order,
-                         args=(signal_event, option, option_ltp, option_previous_low, resolved["created_at"]),
+                         args=(signal_event, option, resolved["created_at"]),
                          name="order-execution", daemon=True).start()
 
     def _publish_signal_queue(self):
@@ -1229,25 +1310,12 @@ class MarketDataService:
             } for item in items]
         self.display.set_signal_queue(values)
 
-    def _execute_approved_order(self, signal_event, option, option_ltp, option_previous_low, created_at):
+    def _execute_approved_order(self, signal_event, option, created_at):
         if self.trading_state != SystemState.RUNNING:
             self.display.add_event(f"ORDER BLOCKED: trading state {self.trading_state}")
             return
         if datetime.now(IST) >= created_at + timedelta(seconds=60):
             self.display.add_event("SIGNAL EXPIRED — NO ORDER PLACED")
-            return
-        option_instrument = self.instruments[signal_event.underlying].__class__(
-            signal_event.underlying, option["symbol"], option["token"], option["exchange"],
-            2 if option["exchange"] == "NFO" else 4
-        )
-        current_quote = self.adapter.ltp_snapshot(option_instrument)
-        current_ltp = current_quote["ltp"]
-        if current_quote["timestamp"] is None:
-            self.display.add_event("ORDER BLOCKED: OPTION_LTP_TIMESTAMP_MISSING")
-            return
-        current_ltp_age = (datetime.now(IST) - current_quote["timestamp"].astimezone(IST)).total_seconds()
-        if current_ltp_age > config.STALE_DATA_SECONDS:
-            self.display.add_event("ORDER BLOCKED: OPTION_LTP_STALE")
             return
         if not self.health.can_signal(signal_event.underlying):
             self.display.add_event(f"ORDER BLOCKED: {signal_event.underlying} feed stale")
@@ -1258,37 +1326,30 @@ class MarketDataService:
             return
         try:
             validate_live_option_contract(option, self.adapter.option_contracts(self.instruments[signal_event.underlying].token))
-            trigger, limit = build_stop_loss(option, option_previous_low, current_ltp,
-                                              config.SL_BUFFER, config.SL_LIMIT_OFFSET)
         except ValueError as error:
-            self.display.add_event(f"RISK/SL VALIDATION FAILED: {error}")
+            self.display.add_event(f"OPTION CONTRACT VALIDATION FAILED: {error}")
             return
+        quantity = self._contract_quantity(option)
         self.display.add_event("LIVE ORDER ABOUT TO BE SENT")
-        self.display.add_event(f"{option['symbol']} QTY:{option['lot_size']} LTP:{current_ltp:.2f}")
+        self.display.add_event(f"{option['symbol']} QTY:{quantity} MARKET ORDER")
         clear, reason = self.order_manager.duplicate_guard(option, self.position_manager)
         if not clear:
             self.display.add_event(f"ORDER BLOCKED: {reason}")
             return
         unresolved_order = bool(self.store.unfinished_order_requests())
         unknown_position = False
-        unprotected_position = False
         with self.position_manager.lock:
             for position in self.position_manager.positions.values():
                 if position.state == "UNKNOWN":
                     unknown_position = True
-                if position.state == "UNPROTECTED_POSITION":
-                    unprotected_position = True
         gate_ok, gate_reason = self.safety.allow_buy(
             feed_healthy=self.health.can_signal(signal_event.underlying),
             broker_authenticated=self.display.snapshot()["components"].get("AUTH") == "READY",
             history_ready=self.display.snapshot()["components"].get("HISTORY") == "READY",
             contract_valid=bool(option["symbol"] and option["token"] and option["expiry"]),
-            option_ltp_fresh=current_ltp > 0 and current_ltp_age <= config.STALE_DATA_SECONDS,
-            risk_valid=config.MAX_RISK_PER_TRADE <= 0 or (current_ltp - trigger) * option["lot_size"] <= config.MAX_RISK_PER_TRADE,
             signal_valid=datetime.now(IST) < created_at + timedelta(seconds=60),
             unresolved_order=unresolved_order,
             unknown_position=unknown_position,
-            unprotected_position=unprotected_position,
             database_ready=self.store.is_healthy(),
         )
         if not gate_ok:
@@ -1302,7 +1363,7 @@ class MarketDataService:
                 return
             reserved = self.store.reserve_order_request(signal_event.signal_id, {
                 "signal_id": signal_event.signal_id, "position_id": "", "order_type": "BUY",
-                "symbol": option["symbol"], "token": option["token"], "quantity": option["lot_size"],
+                "symbol": option["symbol"], "token": option["token"], "quantity": quantity,
                 "created_at": datetime.now(IST).isoformat(), "state": "PENDING",
             })
             if not reserved:
@@ -1311,16 +1372,16 @@ class MarketDataService:
             order_request_started = time.perf_counter()
             self.observability.event("ORDER_REQUEST_SENT", component="ORDERS", payload={
                 "signal_id": signal_event.signal_id, "symbol": option["symbol"],
-                "token": option["token"], "quantity": option["lot_size"],
+                "token": option["token"], "quantity": quantity,
             }, resolution="OBSERVED")
-            order = self.order_manager.place_approved_buy(option, option["lot_size"], request_id=signal_event.signal_id)
+            order = self.order_manager.place_approved_buy(option, quantity, request_id=signal_event.signal_id)
             self.observability.event("ORDER_ACCEPTED", component="ORDERS", payload={
                 "signal_id": signal_event.signal_id, "order_id": order["order_id"],
                 "signal_to_order_latency_ms": round((time.perf_counter() - order_request_started) * 1000, 3),
                 "broker_response": order.get("broker_response"),
             }, resolution="OBSERVED")
             self.store.update_order_request(signal_event.signal_id, "SUBMITTED", order["order_id"])
-            self.display.set_orders([f"{order['order_id']} BUY {option['symbol']} QTY:{option['lot_size']} STATUS:SUBMITTED"])
+            self.display.set_orders([f"{order['order_id']} BUY {option['symbol']} QTY:{quantity} STATUS:SUBMITTED"])
             self._validation_record({
                 "event": "REAL_BROKER_RESPONSE", "signal_id": signal_event.signal_id,
                 "request_timestamp": order["submitted_at"],
@@ -1341,7 +1402,7 @@ class MarketDataService:
                     "broker_order_id": error.order_id,
                     "broker_response": error.response,
                     "symbol": option["symbol"], "token": option["token"],
-                    "quantity": option["lot_size"],
+                    "quantity": quantity,
                 })
             self._record_event(event_type, rejection_details)
             self.observability.event(event_type, component="ORDERS", severity="ERROR" if event_type == "ORDER_REJECTED" else "CRITICAL",
@@ -1387,7 +1448,7 @@ class MarketDataService:
                 "event": "REAL_BROKER_ORDER_STATUS", "signal_id": signal_event.signal_id,
                 "broker_order_id": order["order_id"], "order_book_status": (order_book_entry or {}).get("status"),
                 "filled_quantity": fill_values[1], "average_price": fill_values[0],
-                "remaining_quantity": max(0, option["lot_size"] - fill_values[1]),
+                "remaining_quantity": max(0, quantity - fill_values[1]),
                 "data_classification": "REAL BROKER DATA",
             })
             trade_id = f"T{uuid4().hex[:10].upper()}"
@@ -1397,40 +1458,21 @@ class MarketDataService:
                 self.store.record("orders", order["order_id"], {
                     "signal_id": signal_event.signal_id, "trade_id": trade_id, "status": "PARTIALLY_FILLED",
                     "created_at": datetime.now(IST).isoformat(),
-                    "payload": {"filled_quantity": filled_quantity, "remaining_quantity": option["lot_size"] - filled_quantity},
+                    "payload": {"filled_quantity": filled_quantity, "remaining_quantity": quantity - filled_quantity},
                 })
                 position = Position(trade_id, "UPSTOX", signal_event.underlying, option["expiry"], option["strike"],
                                     option["option_type"], option["token"], filled_quantity, fill_price,
-                                    trigger, order_id=order["order_id"],
+                                    standard_candle=signal_event.previous_candle,
+                                    order_id=order["order_id"],
                                     symbol=option["symbol"], exchange=option["exchange"],
-                                    signal_id=signal_event.signal_id, signal_type=signal_event.signal_type)
+                                    signal_id=signal_event.signal_id, signal_type=signal_event.signal_type,
+                                    entry_filter=signal_event.entry_filter,
+                                    entry_stochastic_values=signal_event.stochastic_values)
                 self.display.add_event(f"🟡 PARTIALLY FILLED {filled_quantity} @ {fill_price:.2f}")
                 self.position_manager.register_partial_fill(position, order["order_id"], fill_price, filled_quantity)
                 self._record_event("BUY_PARTIAL", {"order_id": order["order_id"], "trade_id": trade_id,
                                                     "quantity": filled_quantity, "average_price": fill_price}, "fills")
-                self.store.record("positions", trade_id, {
-                    "signal_id": signal_event.signal_id, "signal_type": signal_event.signal_type,
-                    "underlying": signal_event.underlying, "direction": signal_event.direction,
-                    "instrument_key": option["token"], "expiry": option["expiry"], "strike": option["strike"],
-                    "quantity": filled_quantity, "entry_price": fill_price,
-                    "initial_sl": position.initial_sl, "initial_risk": position.initial_risk,
-                    "exit_state": "OPEN", "order_id": order["order_id"], "sl_order_id": "", "state": "PARTIALLY_FILLED",
-                    "created_at": datetime.now(IST).isoformat(),
-                    "payload": {"symbol": option["symbol"], "token": option["token"]},
-                })
-                partial_sl = self.order_manager.place_stop_loss(option, filled_quantity, trigger, limit, current_ltp)
-                self.order_manager.confirm_order(partial_sl, expected_statuses=("OPEN", "TRIGGER PENDING"))
-                self.position_manager.mark_sl(trade_id, partial_sl)
-                self._record_event("SL_ACTIVE", {"sl_order_id": partial_sl, "trade_id": trade_id}, "stop_orders")
-                self.store.record("stop_losses", partial_sl, {
-                    "trade_id": trade_id, "status": "ACTIVE", "created_at": datetime.now(IST).isoformat(),
-                    "payload": {"quantity": filled_quantity, "trigger": trigger, "limit": limit},
-                })
-                self.store.record("positions", trade_id, {
-                    "order_id": order["order_id"], "sl_order_id": partial_sl, "state": "SL_ACTIVE",
-                    "created_at": datetime.now(IST).isoformat(),
-                    "payload": {"symbol": option["symbol"], "token": option["token"]},
-                })
+                self._persist_position(position)
                 self._halt_trading("Partial BUY fill requires explicit remaining-order reconciliation")
                 return
             fill_price, filled_quantity = fill_values
@@ -1444,9 +1486,12 @@ class MarketDataService:
             self.display.set_orders([f"{order['order_id']} BUY {option['symbol']} QTY:{filled_quantity} PRICE:{fill_price:.2f} STATUS:FILLED"])
             position = Position(trade_id, "UPSTOX", signal_event.underlying, option["expiry"], option["strike"],
                                 option["option_type"], option["token"], filled_quantity, fill_price,
-                                trigger, order_id=order["order_id"],
+                                standard_candle=signal_event.previous_candle,
+                                order_id=order["order_id"],
                                 symbol=option["symbol"], exchange=option["exchange"],
-                                signal_id=signal_event.signal_id, signal_type=signal_event.signal_type)
+                                signal_id=signal_event.signal_id, signal_type=signal_event.signal_type,
+                                entry_filter=signal_event.entry_filter,
+                                entry_stochastic_values=signal_event.stochastic_values)
             self.position_manager.register_fill(position, order["order_id"], fill_price, filled_quantity)
             self._record_event("BUY_FILLED", {"order_id": order["order_id"], "trade_id": trade_id,
                                                "quantity": filled_quantity, "average_price": fill_price}, "fills")
@@ -1454,52 +1499,19 @@ class MarketDataService:
                 "order_id": order["order_id"], "trade_id": trade_id,
                 "quantity": filled_quantity, "average_price": fill_price,
             }, resolution="OBSERVED")
-            self.store.record("positions", trade_id, {
-                    "signal_id": signal_event.signal_id, "signal_type": signal_event.signal_type,
-                    "underlying": signal_event.underlying, "direction": signal_event.direction,
-                    "instrument_key": option["token"], "expiry": option["expiry"], "strike": option["strike"],
-                    "quantity": filled_quantity, "entry_price": fill_price,
-                    "initial_sl": position.initial_sl, "initial_risk": position.initial_risk,
-                    "exit_state": "OPEN", "order_id": order["order_id"], "sl_order_id": "", "state": "OPEN",
-                "created_at": datetime.now(IST).isoformat(),
-                "payload": {"symbol": option["symbol"], "token": option["token"], "quantity": filled_quantity,
-                            "entry_price": fill_price},
-            })
+            self._persist_position(position)
             self.display.add_event(f"💰 FILLED {filled_quantity} @ {fill_price:.2f}")
-            self.display.set_positions([f"{trade_id} {option['symbol']} QTY:{filled_quantity} ENTRY:{fill_price:.2f} SL:{position.sl_reference:.2f} STATUS:OPEN"])
+            self.display.set_positions([f"{trade_id} {option['symbol']} QTY:{filled_quantity} ENTRY:{fill_price:.2f} STATUS:OPEN"])
             self._publish_position_details()
-            sl_order_id = self.order_manager.place_stop_loss(option, filled_quantity, trigger, limit, current_ltp)
-            self.display.add_event(f"🛡 SL REQUEST SENT {sl_order_id}")
-            self.order_manager.confirm_order(sl_order_id, expected_statuses=("OPEN", "TRIGGER PENDING"))
-            self.position_manager.mark_sl(trade_id, sl_order_id)
-            self._record_event("SL_ACTIVE", {"sl_order_id": sl_order_id, "trade_id": trade_id}, "stop_orders")
-            self.store.record("stop_losses", sl_order_id, {
-                "trade_id": trade_id, "status": "ACTIVE", "created_at": datetime.now(IST).isoformat(),
-                "payload": {"quantity": filled_quantity, "trigger": trigger, "limit": limit},
-            })
-            self.store.record("positions", trade_id, {
-                "signal_id": signal_event.signal_id, "signal_type": signal_event.signal_type,
-                "underlying": signal_event.underlying, "direction": signal_event.direction,
-                "instrument_key": option["token"], "expiry": option["expiry"], "strike": option["strike"],
-                "quantity": filled_quantity, "entry_price": fill_price,
-                "initial_sl": position.initial_sl, "initial_risk": position.initial_risk,
-                "exit_state": "OPEN", "order_id": order["order_id"], "sl_order_id": sl_order_id, "state": "SL_ACTIVE",
-                "created_at": datetime.now(IST).isoformat(),
-                "payload": {"symbol": option["symbol"], "token": option["token"], "quantity": filled_quantity,
-                            "entry_price": fill_price},
-            })
-            self.display.add_event(f"🟢 SL ACTIVE {sl_order_id}")
-            self.display.set_positions([f"{trade_id} {option['symbol']} QTY:{filled_quantity} ENTRY:{fill_price:.2f} SL:{position.sl_reference:.2f} STATUS:SL_ACTIVE"])
             self._publish_position_details()
-            self.display.add_event(f"🛡️ POSITION {trade_id}: SL_ACTIVE fill={fill_price:.2f} SL:{sl_order_id}")
+            self.display.add_event(f"POSITION OPEN {trade_id} fill={fill_price:.2f}")
         except Exception as error:
-            if position is not None and position.state in {"OPEN", "PARTIALLY_FILLED", "SL_ACTIVE", "UNPROTECTED_POSITION"}:
-                self.position_manager.mark_unprotected(trade_id)
-                self._halt_trading(f"Unprotected position {trade_id}: {error}")
+            if position is not None and position.state in {"OPEN", "PARTIALLY_FILLED"}:
+                self._halt_trading(f"Position state uncertain {trade_id}: {error}")
             else:
                 self._halt_trading(f"Entry result unknown for broker order {order['order_id']}: {error}")
             trade_label = trade_id or order["order_id"]
-            self.display.add_event(f"🔴 BROKER/SL FAILURE {trade_label}: {error}")
+            self.display.add_event(f"🔴 BROKER/POSITION FAILURE {trade_label}: {error}")
             self.display.add_event(f"🚨 POSITION/ORDER {trade_label} REQUIRES ACTION: {error}")
 
     def _publish_position_details(self):
@@ -1516,9 +1528,6 @@ class MarketDataService:
                     "option": position.symbol, "instrument_key": position.token,
                     "expiry": position.expiry, "strike": position.strike,
                     "quantity": position.quantity, "entry_price": position.entry_price,
-                    "initial_sl": position.initial_sl or position.sl_reference,
-                    "initial_risk": position.initial_risk,
-                    "five_r": strategy_exit.five_r if strategy_exit else None,
                         "current_ltp": (self.display.snapshot().get("option_quotes", {}).get(position.token).ltp
                                 if self.display.snapshot().get("option_quotes", {}).get(position.token) else None),
                         "unrealized_pnl": ((self.display.snapshot().get("option_quotes", {}).get(position.token).ltp - position.entry_price) * position.quantity
@@ -1528,36 +1537,79 @@ class MarketDataService:
                             if self.display.snapshot().get("option_quotes", {}).get(position.token) else position.realized_pnl),
                         "pnl_state": "LIVE" if self.display.snapshot().get("option_quotes", {}).get(position.token) else "LAST KNOWN / STALE",
                     "cci_exit_state": position.cci_exit_state,
-                    "five_r_state": position.five_r_state,
-                    "protective_sl_state": "ACTIVE" if position.sl_order_id else "PENDING",
+                            "strategy_exit": serialize_strategy_exit_state(strategy_exit),
+                            "entry_filter": position.entry_filter,
+                            "entry_order_id": position.order_id,
+                    "reference_candle_timestamp": strategy_exit.reference_candle.timestamp.isoformat()
+                        if strategy_exit and strategy_exit.reference_candle else None,
                     "position_state": position.state, "exit_reason": position.exit_reason,
-                    "fixed_sl": True, "trailing_sl": False,
                 })
         self.display.set_position_details(values)
+
+    def _persist_position(self, position):
+        strategy_exit = position.strategy_exit
+        self.store.record("positions", position.trade_id, {
+            "signal_id": position.signal_id,
+            "signal_type": position.signal_type,
+            "underlying": position.underlying,
+            "direction": "CALL" if position.option_type == "CE" else "PUT",
+            "instrument_key": position.token,
+            "expiry": position.expiry,
+            "strike": position.strike,
+            "quantity": position.quantity,
+            "entry_price": position.entry_price,
+            "exit_state": strategy_exit.exit_state if strategy_exit else position.state,
+            "exit_reason": position.exit_reason,
+            "order_id": position.order_id,
+            "state": position.state,
+            "created_at": datetime.now(IST).isoformat(),
+            "payload": {
+                "trade_id": position.trade_id,
+                "broker": position.broker,
+                "underlying": position.underlying,
+                "expiry": position.expiry,
+                "strike": position.strike,
+                "option_type": position.option_type,
+                "token": position.token,
+                "quantity": position.quantity,
+                "entry_price": position.entry_price,
+                "standard_candle": serialize_candle(position.standard_candle),
+                "state": position.state,
+                "order_id": position.order_id,
+                "symbol": position.symbol,
+                "exchange": position.exchange,
+                "signal_id": position.signal_id,
+                "signal_type": position.signal_type,
+                "entry_filter": position.entry_filter,
+                "entry_stochastic_values": position.entry_stochastic_values,
+                "cci_exit_state": position.cci_exit_state,
+                "exit_reason": position.exit_reason,
+                "exit_order_id": position.exit_order_id,
+                "exit_price": position.exit_price,
+                "exit_timestamp": position.exit_timestamp.isoformat() if position.exit_timestamp else None,
+                "realized_pnl": position.realized_pnl,
+                "strategy_exit": serialize_strategy_exit_state(strategy_exit),
+            },
+        })
 
     def _execute_exit(self, trade_id):
         if not self.order_manager or not self.position_manager:
             return
         with self.exit_lock, self.position_manager.lock:
             position = self.position_manager.positions.get(trade_id)
-            if not position or position.state in {"CLOSED", "ERROR", "UNKNOWN"}:
+            if not position or position.state != "EXIT_PENDING":
                 return
-            self.position_manager.mark_exit_pending(trade_id)
+            self._persist_position(position)
             quantity = position.quantity
         exit_id = str(uuid4())
         self.store.record("exits", exit_id, {
             "trade_id": trade_id, "status": "REQUESTED", "created_at": datetime.now(IST).isoformat(),
         })
         try:
-            if position.sl_order_id:
-                self.display.add_event(f"CANCELLING PROTECTIVE SL {trade_id}")
-                self.order_manager.cancel_and_confirm(position.sl_order_id)
-                self._record_event("SL_CANCEL_CONFIRMED", {
-                    "trade_id": trade_id, "sl_order_id": position.sl_order_id,
-                }, "stop_orders")
-                self.display.add_event(f"SL CANCEL CONFIRMED {trade_id}")
             self._record_event("EXIT_REQUEST_SENT", {"trade_id": trade_id, "quantity": quantity}, "exits")
             order_id = self.order_manager.place_exit(position, quantity)
+            position.exit_order_id = order_id
+            self._persist_position(position)
             self._record_event("EXIT_SUBMITTED", {
                 "trade_id": trade_id, "order_id": order_id, "quantity": quantity,
             }, "exits")
@@ -1569,6 +1621,7 @@ class MarketDataService:
             exit_state, exit_values = self.order_manager.wait_for_fill(order_id)
             if exit_state != "FILLED" or exit_values[1] != quantity:
                 self.position_manager.mark_unknown(trade_id)
+                self._persist_position(position)
                 self._halt_trading(f"Exit fill incomplete for {trade_id}")
                 self._record_event("EXIT_PARTIAL", {
                     "trade_id": trade_id, "order_id": order_id,
@@ -1579,13 +1632,17 @@ class MarketDataService:
             position.exit_timestamp = datetime.now(IST)
             position.realized_pnl = (position.exit_price - position.entry_price) * exit_values[1]
             self.position_manager.mark_closed(trade_id)
+            self._persist_position(position)
             self._publish_position_details()
             self.store.record("exits", exit_id, {
                 "trade_id": trade_id, "status": "FILLED", "created_at": datetime.now(IST).isoformat(),
             })
             self.display.add_event(f"✅ EXIT FILLED {trade_id} ORDER:{order_id}")
         except BrokerOrderRejected as error:
+            if error.order_id:
+                position.exit_order_id = error.order_id
             self.position_manager.mark_unknown(trade_id)
+            self._persist_position(position)
             self._halt_trading(f"Exit broker rejection for {trade_id}: {error}")
             self.store.record("exits", exit_id, {
                 "trade_id": trade_id, "status": "ORDER_REJECTED", "created_at": datetime.now(IST).isoformat(),
@@ -1594,6 +1651,7 @@ class MarketDataService:
             self.display.add_event(f"🔴 BROKER ORDER REJECTED EXIT {trade_id}: {error}")
         except Exception as error:
             self.position_manager.mark_unknown(trade_id)
+            self._persist_position(position)
             self._halt_trading(f"Exit result unknown for {trade_id}: {error}")
             self._record_event("EXIT_UNKNOWN", {"trade_id": trade_id, "reason": str(error)}, "exits")
 
@@ -1630,6 +1688,8 @@ class MarketDataService:
             "rsi_evaluated_sma_values": signal_event.rsi_evaluated_sma_values,
             "rsi_first_matching_timestamp": signal_event.rsi_first_matching_timestamp,
             "rsi_reason": signal_event.rsi_reason,
+            "entry_filter": signal_event.entry_filter,
+            "stochastic_values": signal_event.stochastic_values,
             **values,
         }
 
@@ -1649,8 +1709,8 @@ class MarketDataService:
             if result["missing_local"]:
                 self._record_event("BROKER_MISMATCH", {"tokens": list(result["missing_local"])})
             for trade_id in result.get("externally_closed", set()):
-                self._record_event("EXTERNAL_MANUAL_EXIT", {"trade_id": trade_id}, "position_events")
-                self.display.add_event(f"EXTERNAL MANUAL EXIT {trade_id}")
+                self._record_event("EXTERNAL_POSITION_UNRESOLVED", {"trade_id": trade_id}, "position_events")
+                self.display.add_event(f"EXTERNAL POSITION UNRESOLVED {trade_id}")
             self._on_status("BROKER POSITIONS RECONCILED")
         except Exception as error:
             self._halt_trading(f"Broker reconciliation failed: {error}")

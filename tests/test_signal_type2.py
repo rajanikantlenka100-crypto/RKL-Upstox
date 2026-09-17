@@ -3,7 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from market_data.models import Candle
-from signals.breakout import Type2Engine
+from signals.breakout import Type2Engine, Type3Engine
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -64,6 +64,31 @@ class SignalType2Tests(unittest.TestCase):
         self.assertIsNotNone(engine.evaluate(prev2, prev, running, 96, direction="PUT", rsi_pass=True))
         self.assertIsNone(engine.evaluate(prev2, prev, running, 95, direction="PUT", rsi_pass=True))
         self.assertIsNone(Type2Engine().evaluate(prev2, prev, running, 96, direction="PUT", rsi_pass=False))
+
+    def test_type3_call_is_mirrored_and_ignores_body_limit(self):
+        prev2 = make_candle(self.prev2.timestamp, 100, 108, 92, 100)
+        prev = make_candle(self.prev.timestamp, 96, 110, 86, 101)
+        running = make_candle(self.running.timestamp, 102, 111, 89, 104)
+        signal = Type3Engine().evaluate(prev2, prev, running, 104, direction="CALL", rsi_pass=True, sma_pass=True)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, "CALL")
+        self.assertTrue(signal.type2_conditions["running_low_below_previous_close"])
+
+    def test_type3_put_is_mirrored_and_requires_high_above_previous_close(self):
+        prev2 = make_candle(self.prev2.timestamp, 100, 108, 92, 100)
+        prev = make_candle(self.prev.timestamp, 104, 115, 96, 99)
+        running = make_candle(self.running.timestamp, 98, 109, 92, 105)
+        signal = Type3Engine().evaluate(prev2, prev, running, 110, direction="PUT", rsi_pass=True, sma_pass=True)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, "PUT")
+        self.assertTrue(signal.type2_conditions["running_high_above_previous_close"])
+
+    def test_type3_rejects_when_mirrored_condition_is_missing(self):
+        prev2 = make_candle(self.prev2.timestamp, 100, 108, 92, 100)
+        prev = make_candle(self.prev.timestamp, 96, 110, 86, 101)
+        running = make_candle(self.running.timestamp, 102, 105, 98, 103)
+        self.assertIsNone(Type3Engine().evaluate(prev2, prev, running, 103, direction="CALL", rsi_pass=True, sma_pass=True))
+        self.assertIsNone(Type3Engine().evaluate(prev2, prev, running, 102, direction="PUT", rsi_pass=True, sma_pass=True))
 
 
 if __name__ == "__main__":

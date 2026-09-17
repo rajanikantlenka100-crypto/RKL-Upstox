@@ -14,6 +14,7 @@ class PreflightResult:
     checked_at: str
     checks: dict[str, bool] = field(default_factory=dict)
     failures: tuple[str, ...] = ()
+    reasons: dict[str, str] = field(default_factory=dict)
 
     @property
     def summary(self):
@@ -25,6 +26,7 @@ def run_local_preflight(*, store, instruments, display, position_manager=None,
     """Check production prerequisites that are observable without placing orders."""
     checks = {}
     failures = []
+    reasons = {}
     checks["mode_supported"] = config.EXECUTION_MODE in {"READ_ONLY", "BACKTEST", "SANDBOX", "PRODUCTION"}
     checks["real_order_policy"] = (
         config.ENABLE_REAL_ORDERS
@@ -55,7 +57,7 @@ def run_local_preflight(*, store, instruments, display, position_manager=None,
     checks["position_reconciled"] = display.components.get("BROKER") == "READY"
     checks["order_reconciled"] = not bool(store.unfinished_order_requests())
     checks["no_unknown_positions"] = not any(
-        str(position.state) in {"UNKNOWN", "UNPROTECTED_POSITION"}
+        str(position.state) == "UNKNOWN"
         for position in (position_manager.positions.values() if position_manager else ())
     )
     checks["static_order_ip"] = (
@@ -63,6 +65,15 @@ def run_local_preflight(*, store, instruments, display, position_manager=None,
         if config.EXECUTION_MODE in {"SANDBOX", "PRODUCTION"} and config.ORDER_ENV == "live"
         else True
     )
+    if config.EXECUTION_MODE in {"SANDBOX", "PRODUCTION"} and config.ORDER_ENV == "live":
+        if not public_ip:
+            reasons["static_order_ip"] = "Detected public IP is unavailable"
+        elif not config.ORDER_IP_WHITELIST:
+            reasons["static_order_ip"] = "Configured Upstox order IP is missing"
+        elif public_ip != config.ORDER_IP_WHITELIST:
+            reasons["static_order_ip"] = f"Detected public IP {public_ip} does not match configured order IP {config.ORDER_IP_WHITELIST}"
+        else:
+            reasons["static_order_ip"] = "Detected public IP matches configured order IP"
 
     if order_manager is not None:
         checks["order_client_available"] = bool(order_manager.client) or config.EXECUTION_MODE in {"READ_ONLY", "BACKTEST"}
@@ -75,9 +86,13 @@ def run_local_preflight(*, store, instruments, display, position_manager=None,
         checks["option_engine_configured"] = True
 
     failures.extend(name for name, passed in checks.items() if not passed)
+    for name, passed in checks.items():
+        if name not in reasons:
+            reasons[name] = "PASS" if passed else "CHECK FAILED"
     return PreflightResult(
         passed=not failures,
         checked_at=datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
         checks=checks,
         failures=tuple(failures),
+        reasons=reasons,
     )

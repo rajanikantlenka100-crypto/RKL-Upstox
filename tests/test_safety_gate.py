@@ -10,8 +10,7 @@ class SafetyGateTests(unittest.TestCase):
         gate = SafetyGate(state=SystemState.RUNNING)
         allowed, reason = gate.allow_buy(
             feed_healthy=True, broker_authenticated=True, history_ready=True,
-            contract_valid=True, option_ltp_fresh=True, risk_valid=True,
-            signal_valid=True, database_ready=True,
+            contract_valid=True, signal_valid=True, database_ready=True,
         )
         self.assertTrue(allowed)
         self.assertEqual(reason, "READY")
@@ -20,8 +19,7 @@ class SafetyGateTests(unittest.TestCase):
         gate = SafetyGate(state=SystemState.RUNNING)
         allowed, reason = gate.allow_buy(
             feed_healthy=False, broker_authenticated=True, history_ready=True,
-            contract_valid=True, option_ltp_fresh=True, risk_valid=True,
-            signal_valid=True, database_ready=True,
+            contract_valid=True, signal_valid=True, database_ready=True,
         )
         self.assertFalse(allowed)
         self.assertIn("feed stale", reason)
@@ -36,8 +34,7 @@ class SafetyGateTests(unittest.TestCase):
         gate = SafetyGate(state=SystemState.DEGRADED)
         allowed, reason = gate.allow_buy(
             feed_healthy=True, broker_authenticated=True, history_ready=True,
-            contract_valid=True, option_ltp_fresh=True, risk_valid=True,
-            signal_valid=True, database_ready=True,
+            contract_valid=True, signal_valid=True, database_ready=True,
         )
         self.assertFalse(allowed)
         self.assertIn("system is not RUNNING", reason)
@@ -58,8 +55,7 @@ class SafetyGateTests(unittest.TestCase):
                 gate.shutdown()
             allowed, _ = gate.allow_buy(
                 feed_healthy=True, broker_authenticated=True, history_ready=True,
-                contract_valid=True, option_ltp_fresh=True, risk_valid=True,
-                signal_valid=True, database_ready=True,
+                contract_valid=True, signal_valid=True, database_ready=True,
             )
             self.assertFalse(allowed)
 

@@ -3,9 +3,10 @@
 import sqlite3
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import config
 from market_data.models import Candle
 
 
@@ -112,6 +113,43 @@ class CandleStore:
             self.connection.rollback()
         return True
 
+    def maintenance(self, *, raw_market_retention_days, telemetry_retention_days,
+                    raw_market_max_rows=None, telemetry_max_rows=None):
+        """Bound high-volume operational tables and checkpoint the WAL."""
+        raw_cutoff = (datetime.now(timezone.utc) - timedelta(days=raw_market_retention_days)).isoformat()
+        telemetry_cutoff = (datetime.now(timezone.utc) - timedelta(days=telemetry_retention_days)).isoformat()
+        with self.lock:
+            self.connection.execute(
+                "DELETE FROM raw_market_events WHERE datetime(received_timestamp) < datetime(?)", (raw_cutoff,)
+            )
+            self.connection.execute(
+                "DELETE FROM telemetry_events WHERE datetime(timestamp) < datetime(?)", (telemetry_cutoff,)
+            )
+            if raw_market_max_rows:
+                self.connection.execute(
+                    "DELETE FROM raw_market_events WHERE rowid NOT IN "
+                    "(SELECT rowid FROM raw_market_events ORDER BY received_timestamp DESC LIMIT ?)",
+                    (raw_market_max_rows,),
+                )
+            if telemetry_max_rows:
+                self.connection.execute(
+                    "DELETE FROM telemetry_events WHERE rowid NOT IN "
+                    "(SELECT rowid FROM telemetry_events ORDER BY timestamp DESC LIMIT ?)",
+                    (telemetry_max_rows,),
+                )
+            self.connection.commit()
+            self.connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+
+    def storage_metrics(self):
+        with self.lock:
+            database_path = Path(self.connection.execute("PRAGMA database_list").fetchone()[2])
+            wal_path = Path(f"{database_path}-wal")
+            shm_path = Path(f"{database_path}-shm")
+            return {
+                "database_bytes": database_path.stat().st_size if database_path.exists() else 0,
+                "wal_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+                "shm_bytes": shm_path.stat().st_size if shm_path.exists() else 0,
+            }
     def save(self, candle: Candle):
                 with self.lock:
                         self.connection.execute("""
@@ -150,6 +188,11 @@ class CandleStore:
                 (row.get("event_id"), row.get("instrument_key"), row.get("exchange"), row.get("exchange_timestamp"),
                  row.get("received_timestamp"), row.get("ltp"), row.get("volume", 0), row.get("source"),
                  row.get("sequence"), row.get("payload")),
+            )
+            self.connection.execute(
+                "DELETE FROM raw_market_events WHERE rowid NOT IN "
+                "(SELECT rowid FROM raw_market_events ORDER BY received_timestamp DESC LIMIT ?)",
+                (config.RAW_MARKET_MAX_ROWS,),
             )
             self.connection.commit()
 
@@ -242,12 +285,16 @@ class CandleStore:
         with self.lock:
             rows = self.connection.execute(
                 "SELECT trade_id, signal_id, signal_type, underlying, direction, instrument_key, expiry, strike, "
-                "quantity, entry_price, initial_sl, initial_risk, state, exit_state, exit_reason, payload "
+                "quantity, entry_price, initial_sl, initial_risk, state, exit_state, exit_reason, order_id, payload "
                 "FROM positions ORDER BY created_at"
             ).fetchall()
         values = []
         for row in rows:
-            payload = json.loads(row[-1] or "{}") if isinstance(row[-1], str) else {}
+            stored_payload = json.loads(row[-1] or "{}") if isinstance(row[-1], str) else {}
+            nested_payload = stored_payload.get("payload") if isinstance(stored_payload, dict) else None
+            payload = dict(nested_payload) if isinstance(nested_payload, dict) else {}
+            if isinstance(stored_payload, dict):
+                payload.update({key: value for key, value in stored_payload.items() if key != "payload"})
             values.append({
                 "trade_id": row[0], "signal_id": row[1] or payload.get("signal_id", ""),
                 "signal_type": row[2] or payload.get("signal_type", "TYPE_1"),
@@ -260,6 +307,7 @@ class CandleStore:
                 "initial_risk": row[11] or payload.get("initial_risk"), "state": row[12],
                 "exit_state": row[13] or payload.get("exit_state", "OPEN"),
                 "exit_reason": row[14] or payload.get("exit_reason"),
+                "order_id": row[15] or payload.get("order_id"),
                 "payload": payload,
             })
         return values
@@ -352,6 +400,11 @@ class CandleStore:
                 f"INSERT OR REPLACE INTO telemetry_events ({', '.join(columns)}) VALUES ({placeholders})",
                 [row[column] for column in columns],
             )
+            self.connection.execute(
+                "DELETE FROM telemetry_events WHERE rowid NOT IN "
+                "(SELECT rowid FROM telemetry_events ORDER BY timestamp DESC LIMIT ?)",
+                (config.TELEMETRY_MAX_ROWS,),
+            )
             self.connection.commit()
 
     def telemetry_events(self, report_date=None):
@@ -386,3 +439,21 @@ class CandleStore:
              "payload": json.loads(row[3] or "{}")}
             for row in rows
         ]
+
+    def recent_records(self, table, limit=100):
+        allowed = {"orders", "fills", "exits", "system_events", "position_events", "reconciliation_events"}
+        if table not in allowed:
+            raise ValueError(f"Unsupported observer table: {table}")
+        with self.lock:
+            rows = self.connection.execute(
+                f"SELECT payload FROM {table} ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        records = []
+        for (payload,) in rows:
+            try:
+                value = json.loads(payload or "{}")
+            except (TypeError, ValueError):
+                value = {}
+            if isinstance(value, dict):
+                records.append(value)
+        return records

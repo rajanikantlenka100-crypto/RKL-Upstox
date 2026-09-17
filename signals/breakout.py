@@ -29,9 +29,14 @@ class PutCallSignal:
     rsi_evaluated_sma_values: tuple = ()
     rsi_first_matching_timestamp: datetime | None = None
     rsi_reason: str = ""
+    sma_filter_status: str = "UNAVAILABLE"
+    sma_values: object = None
+    sma_reason: str = ""
     signal_type: str = "TYPE_1"
     prev2_candle: object | None = None
     type2_conditions: object = None
+    entry_filter: str = "sma_normal"
+    stochastic_values: tuple = ()
 
 
 class BreakoutEngine:
@@ -252,6 +257,80 @@ class Type2Engine:
             self.trace_sink({
                 "stage": "TYPE_2_EVALUATION",
                 "signal_type": "TYPE_2",
+                "direction": direction,
+                "prev2_timestamp": prev2.timestamp,
+                "previous_timestamp": previous.timestamp,
+                "running_timestamp": running.timestamp,
+                "conditions": conditions,
+            })
+        except Exception:
+            pass
+
+
+class Type3Engine:
+    """Mirrored Type 2 engine without the small-body restriction and with close-based trigger checks."""
+
+    def __init__(self, trace_sink=None):
+        self.trace_sink = trace_sink
+        self.candle_timestamp = None
+        self.fired = set()
+
+    def reset(self):
+        self.candle_timestamp = None
+        self.fired.clear()
+
+    def evaluate(self, prev2, previous, running, ltp, direction=None, rsi_pass=False, sma_pass=False):
+        if prev2 is None or previous is None or running is None:
+            return None
+        if self.candle_timestamp != running.timestamp:
+            self.candle_timestamp = running.timestamp
+            self.fired.clear()
+        directions = (direction,) if direction else ("CALL", "PUT")
+        for candidate_direction in directions:
+            if candidate_direction == "CALL":
+                conditions = {
+                    "close_above_midpoint": previous.close > (previous.high + previous.low) / 2,
+                    "previous_low_below_prev2_low": previous.low < prev2.low,
+                    "previous_low_below_running_low": previous.low < running.low,
+                    "running_high_breaks_previous_high": running.high > previous.high,
+                    "running_low_below_previous_close": running.low < previous.close,
+                    "rsi_filter": bool(rsi_pass),
+                    "sma_filter": bool(sma_pass),
+                }
+            elif candidate_direction == "PUT":
+                conditions = {
+                    "close_below_midpoint": previous.close < (previous.high + previous.low) / 2,
+                    "previous_high_above_prev2_high": previous.high > prev2.high,
+                    "previous_high_above_running_high": previous.high > running.high,
+                    "running_low_breaks_previous_low": running.low < previous.low,
+                    "running_high_above_previous_close": running.high > previous.close,
+                    "rsi_filter": bool(rsi_pass),
+                    "sma_filter": bool(sma_pass),
+                }
+            else:
+                raise ValueError(f"Unsupported Type 3 direction: {candidate_direction}")
+            self._trace(prev2, previous, running, candidate_direction, conditions)
+            if candidate_direction in self.fired or not all(conditions.values()):
+                continue
+            self.fired.add(candidate_direction)
+            return PutCallSignal(
+                signal_id=str(uuid4()), timestamp=running.timestamp,
+                underlying=running.instrument, direction=candidate_direction,
+                ltp=ltp, previous_candle=previous, running_candle=running,
+                breakout_price=running.high if candidate_direction == "CALL" else running.low,
+                signal_type="TYPE_3", prev2_candle=prev2,
+                type2_conditions=conditions,
+                candle_colour="GREEN" if running.close >= running.open else "RED",
+            )
+        return None
+
+    def _trace(self, prev2, previous, running, direction, conditions):
+        if not self.trace_sink:
+            return
+        try:
+            self.trace_sink({
+                "stage": "TYPE_3_EVALUATION",
+                "signal_type": "TYPE_3",
                 "direction": direction,
                 "prev2_timestamp": prev2.timestamp,
                 "previous_timestamp": previous.timestamp,
