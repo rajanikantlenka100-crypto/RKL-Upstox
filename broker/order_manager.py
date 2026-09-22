@@ -20,15 +20,16 @@ class BrokerOrderRejected(RuntimeError):
 
 
 class OrderExecutor:
-    def __init__(self, client):
+    def __init__(self, client, execution_enabled=None):
         self.client = client
+        self.execution_enabled = execution_enabled
         self.order_lock = threading.RLock()
         self.submitted_requests = set()
 
     def place_approved_buy(self, contract, quantity, request_id=None):
         if quantity <= 0 or quantity % contract["lot_size"] != 0:
             raise ValueError("New trades must use a positive whole number of current contract lots")
-        if not config.order_execution_enabled():
+        if not self._execution_allowed():
             raise RuntimeError("Real orders are disabled; set REAL_ORDERS_ENABLED=ON only after Upstox rule review")
         with self.order_lock:
             if request_id and request_id in self.submitted_requests:
@@ -99,7 +100,7 @@ class OrderExecutor:
     def place_exit(self, position, quantity):
         if quantity <= 0 or quantity > position.quantity:
             raise ValueError("Exit quantity must be positive and no greater than the position quantity")
-        if not config.order_execution_enabled():
+        if not self._execution_allowed():
             raise RuntimeError("Real orders are disabled; exit was not submitted")
         params = {"instrument_token": position.token, "transaction_type": "SELL", "order_type": "MARKET", "price": 0, "quantity": quantity}
         try:
@@ -120,6 +121,9 @@ class OrderExecutor:
     def _place_order(self, params):
         with self.order_lock:
             return self.client.place_order(params)
+
+    def _execution_allowed(self):
+        return config.order_execution_enabled() if self.execution_enabled is None else bool(self.execution_enabled)
 
     def confirm_order(self, order_id, expected_statuses=("OPEN", "TRIGGER PENDING", "COMPLETE")):
         response = self.client.orderBook()

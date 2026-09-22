@@ -4,9 +4,48 @@ import queue
 import threading
 import sys
 from datetime import datetime, timedelta
+from dataclasses import replace
 
 _PRIMARY = {"NIFTY", "SENSEX"}
 _PRIORITY = {"NIFTY": 0, "SENSEX": 1, "BANKNIFTY": 2, "MIDCPNIFTY": 3}
+
+
+class SignalArbitrator:
+    """Accept at most one executable signal per underlying and running candle."""
+
+    def __init__(self):
+        self.locks = {}
+        self.lock = threading.RLock()
+
+    def reset(self, underlying, candle_timestamp):
+        with self.lock:
+            self.locks.pop((underlying, candle_timestamp), None)
+
+    def admit(self, candidates):
+        if not candidates:
+            return None, "NO_CANDIDATE"
+        key = (candidates[0].underlying, candidates[0].timestamp)
+        if any((candidate.underlying, candidate.timestamp) != key for candidate in candidates):
+            return None, "CANDIDATE_KEY_MISMATCH"
+        directions = {candidate.direction for candidate in candidates}
+        with self.lock:
+            self.locks = {
+                lock_key: value for lock_key, value in self.locks.items()
+                if lock_key[0] != key[0] or lock_key[1] == key[1]
+            }
+            if key in self.locks:
+                return None, "CANDLE_LOCKED"
+            if len(directions) != 1:
+                return None, "CONTRADICTORY_DIRECTION"
+            primary = candidates[0]
+            matched_types = tuple(dict.fromkeys(candidate.signal_type for candidate in candidates))
+            signal_type = "+".join(matched_types)
+            accepted = replace(primary,
+                               signal_type=signal_type,
+                               matched_signal_types=matched_types,
+                               signal_lock_status="ACCEPTED_LOCKED")
+            self.locks[key] = accepted
+            return accepted, "ACCEPTED" if len(matched_types) == 1 else "CONSOLIDATED"
 
 
 class SignalCoordinator:

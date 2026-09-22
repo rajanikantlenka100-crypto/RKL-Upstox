@@ -304,7 +304,7 @@ HTML = """<!doctype html>
         const values = state.indicators?.[name] || [null, null];
         const detail = state.indicator_details?.[name] || {};
         const reason = state.indicator_reason?.[name] || "--";
-        return '<div class="entry"><strong>' + name + '</strong><div>SMA8/13/21: <span class="info">' + [detail.sma8, detail.sma13, detail.sma21].map(value => fmtNumber(value)).join(' / ') + '</span></div><div>RSI14: <span class="info">' + fmtNumber(values[1], 2) + '</span></div><div>RSI14-SMA5: <span class="info">' + fmtNumber(detail.rsi_sma5, 2) + '</span></div><div>CCI5: <span class="info">' + fmtNumber(values[0], 2) + '</span> · Fast Stochastic14: <span class="info">' + fmtNumber(detail.stochastic14, 2) + '</span></div><div>Trend: <span class="' + statusClass(detail.trend) + '">' + (detail.trend || 'UNAVAILABLE') + '</span></div><div class="dim">' + (reason || "UNAVAILABLE") + '</div></div>';
+        return '<div class="entry"><strong>' + name + '</strong><div>RSI14: <span class="info">' + fmtNumber(values[1], 2) + '</span> · RSI14-SMA14: <span class="info">' + fmtNumber(detail.rsi_sma14, 2) + '</span></div><div>CCI5: <span class="info">' + fmtNumber(values[0], 2) + '</span> · Fast Stochastic14: <span class="info">' + fmtNumber(detail.stochastic14, 2) + '</span></div><div class="dim">' + (reason || "UNAVAILABLE") + '</div></div>';
       });
       document.getElementById("indicatorGrid").innerHTML = entries.join("");
     }
@@ -316,9 +316,9 @@ HTML = """<!doctype html>
         document.getElementById("signalState").textContent = "UNAVAILABLE";
         return;
       }
-      const conditions = signal.filters && Object.keys(signal.filters).length ? '<div class="dim">Conditions: ' + Object.entries(signal.filters).map(([key, value]) => key + '=' + (value ? 'PASS' : 'FAIL')).join(' · ') + '</div>' : '';
+      const conditions = signal.signal_type.includes("TYPE_1") ? '<div>RSI14 ' + (signal.direction === "CALL" ? '&gt;' : '&lt;') + ' RSI14 SMA14</div><div>' + (signal.direction === "CALL" ? 'Running Low &lt; Previous Low' : 'Running High &gt; Previous High') + '</div><div>' + (signal.direction === "CALL" ? 'Running High &gt; Previous High' : 'Running Low &lt; Previous Low') + '</div><div>Running colour: ' + (signal.direction === "CALL" ? 'GREEN' : 'RED') + '</div>' : (signal.filters && Object.keys(signal.filters).length ? '<div class="dim">Conditions: ' + Object.entries(signal.filters).map(([key, value]) => key + '=' + (value ? 'PASS' : 'FAIL')).join(' · ') + '</div>' : '');
       const stochastic = (signal.stochastic_values || []).length ? '<div>Closed Stochastic values: ' + signal.stochastic_values.map(value => fmtNumber(value, 2)).join(' · ') + '</div>' : '';
-      panel.innerHTML = '<div class="entry"><strong>' + (signal.underlying || "UNAVAILABLE") + ' ' + (signal.signal_type || "UNAVAILABLE") + '</strong><div>Direction: ' + (signal.direction || "UNAVAILABLE") + '</div><div>Signal time: ' + (signal.timestamp || "UNAVAILABLE") + '</div><div>State: ' + (signal.status || "UNAVAILABLE") + '</div><div>Entry filter: <span class="info">' + (signal.entry_filter || "UNAVAILABLE") + '</span></div>' + stochastic + conditions + '</div>';
+      panel.innerHTML = '<div class="entry"><strong>' + (signal.underlying || "UNAVAILABLE") + ' ' + (signal.signal_type || "UNAVAILABLE") + '</strong><div>Direction: ' + (signal.direction || "UNAVAILABLE") + '</div><div>Signal time: ' + (signal.timestamp || "UNAVAILABLE") + '</div><div>State: ' + (signal.status || "UNAVAILABLE") + '</div><div>Lock: ' + (signal.signal_lock_status || "UNAVAILABLE") + '</div><div>RSI14 / SMA14: ' + fmtNumber(signal.rsi14, 2) + ' / ' + fmtNumber(signal.rsi14_sma14, 2) + '</div><div>Entry filter: <span class="info">' + (signal.entry_filter || "UNAVAILABLE") + '</span></div>' + stochastic + conditions + '</div>';
       document.getElementById("signalState").textContent = signal.status || "UNAVAILABLE";
     }
     function renderApprovalPanel(state) {
@@ -668,7 +668,7 @@ class DashboardServer:
         self.mobile_ws_async_stop = None
         self._stop = threading.Event()
         self.browser_opened = False
-        self.url = f"http://{self.host}:{self.port}/"
+        self.url = self._browser_target_url()
 
     def _mobile_payload(self, path, query=None):
         snapshot = self.state.snapshot()
@@ -886,6 +886,13 @@ class DashboardServer:
         self.mobile_ws_thread = threading.Thread(target=runner, name="mobile-websocket", daemon=True)
         self.mobile_ws_thread.start()
 
+    def _browser_target_url(self):
+        if self.host in {"0.0.0.0", "::", ""}:
+            return f"http://localhost:{self.port}/"
+        if self.host in {"127.0.0.1", "localhost", "::1"}:
+            return f"http://{self.host}:{self.port}/"
+        return f"http://{self.host}:{self.port}/"
+
     def start(self, open_browser=True):
         state = self.state
         owner = self
@@ -1028,7 +1035,7 @@ class DashboardServer:
         self._wait_for_root(timeout=10)
         if open_browser:
           self.browser_opened = self._open_browser()
-        return self.url
+        return self._browser_target_url()
 
     def _wait_for_health(self, timeout=10):
         deadline = time.monotonic() + timeout
@@ -1053,14 +1060,15 @@ class DashboardServer:
             raise RuntimeError(f"Dashboard root check failed at {self.url}: {error}") from error
 
     def _open_browser(self):
+        browser_url = self._browser_target_url()
         if os.environ.get("DISPLAY") is None and os.name != "nt":
             return False
         try:
-            opened = webbrowser.open(self.url)
+            opened = webbrowser.open(browser_url)
             if not opened:
-                print("[BROWSER] AUTO-OPEN FAILED — dashboard remains available at configured URL", flush=True)
+                print(f"[BROWSER] AUTO-OPEN FAILED — dashboard remains available at {browser_url}", flush=True)
             else:
-                print("[BROWSER] OPENED", flush=True)
+                print(f"[BROWSER] OPENED {browser_url}", flush=True)
             return opened
         except Exception as error:  # pragma: no cover - browser launch is environment-dependent
             print(f"[BROWSER] AUTO-OPEN FAILED — {error}", flush=True)

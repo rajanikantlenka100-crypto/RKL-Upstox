@@ -59,7 +59,7 @@ class SandboxLedger:
             "completed_trades": 0,
         }.items():
             setattr(self, key, float(payload.get(key, default)) if key in {"opening_capital", "available_capital", "deployed_capital", "realized_pnl", "unrealized_pnl", "charges", "equity", "peak_equity", "drawdown"} else int(payload.get(key, default)))
-        self.equity = self.available_capital + self.realized_pnl + self.unrealized_pnl - self.charges
+        self.equity = self.available_capital + self.deployed_capital + self.unrealized_pnl
         self.peak_equity = max(self.peak_equity, self.equity)
         self.drawdown = max(0.0, self.peak_equity - self.equity)
 
@@ -84,8 +84,8 @@ class SandboxLedger:
         with self._lock:
             self.completed_trades += 1
             self.realized_pnl += float(pnl)
-            self.available_capital = self.opening_capital + self.realized_pnl - self.deployed_capital - self.charges
-            self.equity = self.available_capital + self.realized_pnl + self.unrealized_pnl - self.charges
+            self.available_capital = self.opening_capital - self.deployed_capital + self.realized_pnl - self.charges
+            self.equity = self.available_capital + self.deployed_capital + self.unrealized_pnl
             self.peak_equity = max(self.peak_equity, self.equity)
             self.drawdown = max(0.0, self.peak_equity - self.equity)
             if float(pnl) > 0:
@@ -117,6 +117,7 @@ class SandboxOrderExecutor:
 
     def __init__(self, quote_provider):
         self.quote_provider = quote_provider
+        self.execution_enabled = True
         self.client = self
         self.order_lock = threading.RLock()
         self.orders = {}
@@ -140,10 +141,8 @@ class SandboxOrderExecutor:
         return max(0.01, price + slippage)
 
     def place_approved_buy(self, contract, quantity, request_id=None):
-        if config.EXECUTION_MODE != "SANDBOX":
-            raise SandboxExecutionError("SANDBOX_EXECUTOR_MODE_MISMATCH")
-        if config.ENABLE_REAL_ORDERS:
-            raise SandboxExecutionError("SANDBOX_REAL_ORDERS_MUST_BE_OFF")
+        if not self.execution_enabled:
+            raise SandboxExecutionError("SANDBOX_EXECUTION_DISABLED")
         if quantity <= 0 or quantity % contract["lot_size"] != 0:
             raise ValueError("Sandbox trades must use a positive whole number of current contract lots")
         with self.order_lock:
@@ -180,8 +179,8 @@ class SandboxOrderExecutor:
             }
 
     def place_exit(self, position, quantity):
-        if config.EXECUTION_MODE != "SANDBOX":
-            raise SandboxExecutionError("SANDBOX_EXECUTOR_MODE_MISMATCH")
+        if not self.execution_enabled:
+            raise SandboxExecutionError("SANDBOX_EXECUTION_DISABLED")
         with self.order_lock:
             if quantity <= 0 or quantity > position.quantity:
                 raise ValueError("Exit quantity must be positive and no greater than the position quantity")

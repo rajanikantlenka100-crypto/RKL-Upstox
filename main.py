@@ -16,7 +16,7 @@ from broker.validation_report import LiveBrokerValidationReport
 from instruments.options import select_atm_option, select_candidate_options, validate_live_option_contract
 from instruments.resolver import resolve_indices
 from market_data.candles import CandleEngine
-from market_data.indicators import cci, fast_stochastic, fast_stochastic_series, rsi, stochastic_entry_exception, validate_sma_trend
+from market_data.indicators import cci, fast_stochastic, fast_stochastic_series, rsi, rsi_sma_series
 from market_data.health import FeedHealth
 from market_data.historical import parse_historical_row
 from market_data.models import Candle, MarketTick
@@ -31,7 +31,7 @@ from observability import Observability
 from services.preflight import run_local_preflight
 from terminal_display import TerminalDisplay
 from web_dashboard import DashboardServer
-from signals.coordinator import ApprovalController, KeyboardController, SignalCoordinator
+from signals.coordinator import ApprovalController, KeyboardController, SignalArbitrator, SignalCoordinator
 from trading.approval import approval_summary
 from trading.positions import Position, PositionManager, serialize_candle, serialize_strategy_exit_state
 from trading.sandbox_execution import SandboxOrderExecutor
@@ -68,6 +68,7 @@ class MarketDataService:
         self.type2_engines = {name: Type2Engine(self.signal_trace.write) for name in self.instruments}
         self.type3_engines = {name: Type3Engine(self.signal_trace.write) for name in self.instruments}
         self.coordinator = SignalCoordinator(expiry_seconds=60)
+        self.signal_arbitrator = SignalArbitrator()
         self.approval_controller = ApprovalController(self.coordinator, self._on_approval_decision)
         self.keyboard_controller = KeyboardController(self.approval_controller, self._on_keyboard_command)
         self.pending_signals = {}
@@ -392,21 +393,23 @@ class MarketDataService:
             if current:
                 self._evaluate_running_exits(tick.instrument, current)
             previous = engine.previous.get(tick.instrument)
-            signal_event = (self.breakouts[tick.instrument].evaluate(previous, current, tick.ltp, tick.timestamp)
-                            if config.SIGNAL_TYPE_1_ENABLED and self.signals_enabled
-                            and self.trading_state == SystemState.RUNNING
-                            and self.health.can_signal(tick.instrument)
-                            and tick.instrument not in self.reconciliation_blocked else None)
+            history = engine.history.get(tick.instrument, [])
+            signal_candidates = []
+            type1_direction = None
+            type1_rsi = None
+            if config.SIGNAL_TYPE_1_ENABLED and self.signals_enabled and self.trading_state == SystemState.RUNNING \
+                    and self.health.can_signal(tick.instrument) and tick.instrument not in self.reconciliation_blocked:
+                for candidate_direction in ("CALL", "PUT"):
+                    candidate_rsi = validate_rsi_entry(history, candidate_direction)
+                    if candidate_rsi.result == "PASS":
+                        type1_direction = candidate_direction
+                        type1_rsi = candidate_rsi
+                        break
+            signal_event = self.breakouts[tick.instrument].evaluate(
+                previous, current, tick.ltp, tick.timestamp, direction=type1_direction
+            ) if type1_direction else None
             if signal_event:
-                history = engine.history.get(tick.instrument, [])
-                sma_result = self._entry_sma_result(history, signal_event.direction)
-                rsi_result = validate_rsi_entry(
-                    engine.history.get(tick.instrument, []),
-                    signal_event.direction,
-                    config.RSI_PERIOD,
-                    config.RSI_SMA_PERIOD,
-                    config.RSI_LOOKBACK_PERIODS,
-                )
+                rsi_result = type1_rsi
                 signal_event = replace(
                     signal_event,
                     rsi_filter_status=rsi_result.result,
@@ -417,54 +420,15 @@ class MarketDataService:
                     rsi_first_matching_timestamp=(rsi_result.matching_candle_timestamps[0]
                                                    if rsi_result.matching_candle_timestamps else None),
                     rsi_reason=rsi_result.reason,
-                    sma_filter_status=sma_result["result"],
-                    sma_values=sma_result.get("values"),
-                    sma_reason=sma_result["reason"],
-                    entry_filter=sma_result["entry_filter"],
-                    stochastic_values=sma_result["stochastic_values"],
+                    type1_conditions={**signal_event.type1_conditions, "rsi_filter": True},
+                    rsi14=rsi_result.evaluated_rsi_values[-1],
+                    rsi14_sma14=rsi_result.evaluated_sma_values[-1],
+                    entry_filter="rsi14_vs_rsi14_sma14",
                 )
-                if self._entry_filters_pass(rsi_result, sma_result):
-                    self.signal_trace.write({
-                        "stage": "ENTRY_FILTERS", "reason_code": "SMA_RSI_PASS",
-                        "signal_id": signal_event.signal_id, "underlying": signal_event.underlying,
-                        "direction": signal_event.direction, "matching_periods": rsi_result.matching_periods,
-                        "entry_filter": signal_event.entry_filter,
-                        "stochastic_values": signal_event.stochastic_values,
-                    })
-                    self._show_signal(signal_event)
-                else:
-                    self.signal_trace.write({
-                        "stage": "ENTRY_FILTERS", "reason_code": "SMA_" + sma_result["result"] if sma_result["result"] != "PASS" else "RSI_" + rsi_result.result,
-                        "signal_id": signal_event.signal_id, "underlying": signal_event.underlying,
-                        "direction": signal_event.direction, "matching_periods": rsi_result.matching_periods,
-                        "sma_reason": sma_result["reason"], "rsi_reason": rsi_result.reason,
-                        "stochastic_values": sma_result["stochastic_values"],
-                    })
-                    self._record_event("ENTRY_FILTERS_BLOCKED", {
-                        "signal_id": signal_event.signal_id,
-                        "direction": signal_event.direction,
-                        "matching_periods": rsi_result.matching_periods,
-                        "evaluated_periods": [timestamp.isoformat() for timestamp in rsi_result.evaluated_candle_timestamps],
-                        "evaluated_rsi_values": rsi_result.evaluated_rsi_values,
-                        "evaluated_sma_values": rsi_result.evaluated_sma_values,
-                        "sma_filter_status": sma_result["result"],
-                        "sma_values": sma_result.get("values"),
-                        "sma_reason": sma_result["reason"],
-                        "reason": rsi_result.reason,
-                    }, "signal_events")
-                    self.signal_audit.write(self._audit_record(signal_event, {
-                        "status": "ENTRY_FILTERS_BLOCKED",
-                        "sma_filter_status": sma_result["result"],
-                        "sma_values": sma_result.get("values"),
-                        "sma_reason": sma_result["reason"],
-                        "rsi_filter_status": rsi_result.result,
-                        "rsi_matching_periods": rsi_result.matching_periods,
-                        "rsi_evaluated_periods": [timestamp.isoformat() for timestamp in rsi_result.evaluated_candle_timestamps],
-                        "rsi_evaluated_values": rsi_result.evaluated_rsi_values,
-                        "rsi_evaluated_sma_values": rsi_result.evaluated_sma_values,
-                        "rsi_matching_periods_timestamps": [timestamp.isoformat() for timestamp in rsi_result.matching_candle_timestamps],
-                        "rsi_reason": rsi_result.reason,
-                    }))
+                self.signal_trace.write({"stage": "ENTRY_FILTERS", "reason_code": "RSI_PASS",
+                                         "signal_id": signal_event.signal_id, "underlying": signal_event.underlying,
+                                         "direction": signal_event.direction, "rsi_reason": rsi_result.reason})
+                signal_candidates.append(signal_event)
             if (config.SIGNAL_TYPE_2_ENABLED and self.signals_enabled and self.trading_state == SystemState.RUNNING
                     and self.health.can_signal(tick.instrument)
                     and tick.instrument not in self.reconciliation_blocked and current):
@@ -475,12 +439,11 @@ class MarketDataService:
                         history, direction, config.RSI_PERIOD,
                         config.RSI_SMA_PERIOD, config.RSI_LOOKBACK_PERIODS,
                     )
-                    type2_sma = self._entry_sma_result(history, direction)
                     type2_event = self.type2_engines[tick.instrument].evaluate(
                         prev2, previous, current, tick.ltp, direction=direction,
-                        rsi_pass=self._entry_filters_pass(type2_rsi, type2_sma),
+                        rsi_pass=type2_rsi.result == "PASS",
                     )
-                    if type2_event and self._entry_filters_pass(type2_rsi, type2_sma):
+                    if type2_event and type2_rsi.result == "PASS":
                         type2_event = replace(
                             type2_event,
                             rsi_filter_status=type2_rsi.result,
@@ -491,13 +454,9 @@ class MarketDataService:
                             rsi_first_matching_timestamp=(type2_rsi.matching_candle_timestamps[0]
                                                            if type2_rsi.matching_candle_timestamps else None),
                             rsi_reason=type2_rsi.reason,
-                            sma_filter_status=type2_sma["result"],
-                            sma_values=type2_sma.get("values"),
-                            sma_reason=type2_sma["reason"],
-                            entry_filter=type2_sma["entry_filter"],
-                            stochastic_values=type2_sma["stochastic_values"],
+                            entry_filter="rsi14_vs_rsi14_sma14",
                         )
-                        self._show_signal(type2_event)
+                        signal_candidates.append(type2_event)
             if (config.SIGNAL_TYPE_3_ENABLED and self.signals_enabled and self.trading_state == SystemState.RUNNING
                     and self.health.can_signal(tick.instrument)
                     and tick.instrument not in self.reconciliation_blocked and current):
@@ -508,14 +467,12 @@ class MarketDataService:
                         history, direction, config.RSI_PERIOD,
                         config.RSI_SMA_PERIOD, config.RSI_LOOKBACK_PERIODS,
                     )
-                    type3_sma = self._entry_sma_result(history, direction)
                     type3_event = self.type3_engines[tick.instrument].evaluate(
                         prev2, previous, current, tick.ltp, direction=direction,
                         rsi_pass=type3_rsi.result == "PASS",
-                        sma_pass=type3_sma["result"] == "PASS",
                     )
-                    if type3_event and self._entry_filters_pass(type3_rsi, type3_sma):
-                        self._show_signal(replace(
+                    if type3_event and type3_rsi.result == "PASS":
+                        signal_candidates.append(replace(
                             type3_event,
                             rsi_filter_status=type3_rsi.result,
                             rsi_matching_periods=type3_rsi.matching_periods,
@@ -525,18 +482,37 @@ class MarketDataService:
                             rsi_first_matching_timestamp=(type3_rsi.matching_candle_timestamps[0]
                                                            if type3_rsi.matching_candle_timestamps else None),
                             rsi_reason=type3_rsi.reason,
-                            sma_filter_status=type3_sma["result"],
-                            sma_values=type3_sma.get("values"),
-                            sma_reason=type3_sma["reason"],
-                            entry_filter=type3_sma["entry_filter"],
-                            stochastic_values=type3_sma["stochastic_values"],
+                            entry_filter="rsi14_vs_rsi14_sma14",
                         ))
+            self._admit_signal_candidates(signal_candidates)
         except (KeyError, ValueError) as error:
             self._on_status(f"INVALID MARKET DATA: {error}")
         except Exception as error:
             self.display.set_health(tick.instrument, "PROCESSING_ERROR")
             self.display.add_event(f"MARKET DATA ERROR {tick.instrument}: {error}")
             self._on_status(f"MARKET DATA PROCESSING ERROR: {error}")
+
+    def _admit_signal_candidates(self, candidates):
+        if not candidates:
+            return
+        accepted, reason = self.signal_arbitrator.admit(candidates)
+        if accepted is None:
+            event_type = "CONTRADICTORY_DIRECTION_REJECTED" if reason == "CONTRADICTORY_DIRECTION" else "SIGNAL_REJECTED_CANDLE_LOCKED"
+            self._record_event(event_type, {
+                "underlying": candidates[0].underlying,
+                "candle_timestamp": candidates[0].timestamp.isoformat(),
+                "candidate_directions": [candidate.direction for candidate in candidates],
+                "source_types": [candidate.signal_type for candidate in candidates],
+            }, "signal_events")
+            return
+        if reason == "CONSOLIDATED":
+            self._record_event("SIGNAL_CONSOLIDATED", {
+                "signal_id": accepted.signal_id,
+                "underlying": accepted.underlying,
+                "candle_timestamp": accepted.timestamp.isoformat(),
+                "source_types": accepted.matched_signal_types,
+            }, "signal_events")
+        self._show_signal(accepted)
 
     def _try_activate_execution_preflight(self):
         if config.EXECUTION_MODE not in {"PRODUCTION", "SANDBOX"} or config.PREFLIGHT_PASSED:
@@ -553,34 +529,6 @@ class MarketDataService:
         config.set_preflight_passed(True)
         self.display.set_component("PREFLIGHT", "READY")
         self.display.add_event("PRODUCTION PRE-FLIGHT PASS | REAL ORDER GATE OPEN")
-
-    @staticmethod
-    def _entry_sma_result(history, direction):
-        result = validate_sma_trend(history, direction)
-        exception = stochastic_entry_exception(history, direction)
-        result = dict(result)
-        result["stochastic_values"] = exception["values"]
-        result["stochastic_exception"] = exception["allowed"]
-        if result["result"] == "PASS":
-            result["entry_filter"] = "sma_normal"
-            return result
-        opposite_trend = (
-            direction == "CALL" and result["reason"].startswith("CALL blocked")
-        ) or (
-            direction == "PUT" and result["reason"].startswith("PUT blocked")
-        )
-        if opposite_trend and exception["allowed"]:
-            result["result"] = "PASS"
-            result["reason"] = "STOCHASTIC_EXCEPTION"
-            result["entry_filter"] = "stochastic_exception"
-        else:
-            result["entry_filter"] = "unavailable" if result["result"] == "UNAVAILABLE" else "sma_normal"
-        return result
-
-    @staticmethod
-    def _entry_filters_pass(rsi_result, sma_result):
-        """Use one finalized-candle admission decision for every signal type."""
-        return rsi_result.result == "PASS" and sma_result["result"] == "PASS"
 
     def _on_candle_closed(self, candle):
         try:
@@ -610,6 +558,8 @@ class MarketDataService:
         cci_value = cci(candles, config.CCI_PERIOD)
         rsi_value = rsi(candles, config.RSI_PERIOD)
         self.display.set_indicators(candle.instrument, cci_value, rsi_value, candle.timestamp)
+        rsi_sma_values = rsi_sma_series(candles, config.RSI_PERIOD, config.RSI_SMA_PERIOD)
+        self.display.set_rsi_sma14(candle.instrument, rsi_sma_values[-1] if rsi_sma_values else None)
         candles_before_close = self.engines[candle.instrument].history[candle.instrument]
         prior_candle = candles_before_close[-2] if len(candles_before_close) >= 2 else None
         stochastic_values = fast_stochastic_series(candles, 14)
@@ -761,8 +711,20 @@ class MarketDataService:
                                  message=payload.get("error", ""), payload=payload)
 
     def _record_signal_candidate(self, payload):
-        self.observability.event(payload.get("reason_code", "SIGNAL_CANDIDATE"), component="SIGNALS",
-                                 payload=payload, resolution="OBSERVED")
+        reason_code = payload.get("reason_code", "SIGNAL_CANDIDATE")
+
+        # High-frequency evaluation traces are retained by CandidateTrace,
+        # but NO_BREAKOUT must not create a SQLite telemetry transaction
+        # on every market tick.
+        if reason_code == "NO_BREAKOUT":
+            return
+
+        self.observability.event(
+            reason_code,
+            component="SIGNALS",
+            payload=payload,
+            resolution="OBSERVED",
+        )
 
     def _on_portfolio_event(self, event):
         self._record_event("PORTFOLIO_STREAM_EVENT", {"payload": event})
@@ -1170,6 +1132,11 @@ class MarketDataService:
             "status": "OPTION DATA PENDING",
             "signal_id": signal_event.signal_id, "priority": "PRIMARY" if signal_event.underlying in {"NIFTY", "SENSEX"} else "SECONDARY",
             "type2_conditions": signal_event.type2_conditions,
+            "type1_conditions": signal_event.type1_conditions,
+            "matched_signal_types": signal_event.matched_signal_types,
+            "signal_lock_status": signal_event.signal_lock_status,
+            "rsi14": signal_event.rsi14,
+            "rsi14_sma14": signal_event.rsi14_sma14,
             "entry_filter": signal_event.entry_filter,
             "stochastic_values": signal_event.stochastic_values,
             "created_at": created_at.isoformat(), "expires_at": expires_at.isoformat(),
@@ -1222,6 +1189,11 @@ class MarketDataService:
                                      "signal_id": signal_event.signal_id, "priority": "PRIMARY" if signal_event.underlying in {"NIFTY", "SENSEX"} else "SECONDARY",
                                      "signal_type": signal_event.signal_type,
                                      "type2_conditions": signal_event.type2_conditions,
+                                     "type1_conditions": signal_event.type1_conditions,
+                                     "matched_signal_types": signal_event.matched_signal_types,
+                                     "signal_lock_status": signal_event.signal_lock_status,
+                                     "rsi14": signal_event.rsi14,
+                                     "rsi14_sma14": signal_event.rsi14_sma14,
                                      "entry_filter": signal_event.entry_filter,
                                      "stochastic_values": signal_event.stochastic_values,
                                      "created_at": created_at.isoformat(), "expires_at": expires_at.isoformat()})

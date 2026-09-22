@@ -2,7 +2,6 @@ import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from main import MarketDataService
 from market_data.indicators import fast_stochastic, fast_stochastic_series, stochastic_entry_exception
 from market_data.models import Candle
 from trading.exit_engine import StrategyExitState
@@ -39,28 +38,16 @@ class StochasticIndicatorTests(unittest.TestCase):
         candles[-1] = candle(13, 99, low=80, high=100)
         self.assertTrue(stochastic_entry_exception(candles, "PUT")["allowed"])
 
-    def test_entry_sma_exception_is_per_index(self):
+    def test_stochastic_values_remain_per_index(self):
         history = [candle(index, 100 + index, instrument="NIFTY") for index in range(21)]
-        result = MarketDataService._entry_sma_result(history, "CALL")
-        self.assertEqual(result["entry_filter"], "sma_normal")
         other = [candle(index, 100 + index, instrument="SENSEX") for index in range(21)]
         other[-1] = candle(20, 90, low=80, high=100, instrument="SENSEX")
         self.assertEqual(len(fast_stochastic_series(history)), len(fast_stochastic_series(other)))
 
-    def test_bearish_sma_call_is_allowed_only_by_closed_stochastic_exception(self):
-        history = [candle(index, 121 - index, low=120 - index, high=122 - index) for index in range(20)]
-        history.append(candle(20, 100, low=100, high=110))
-        result = MarketDataService._entry_sma_result(history, "CALL")
-        self.assertEqual(result["result"], "PASS")
-        self.assertEqual(result["entry_filter"], "stochastic_exception")
-        self.assertTrue(any(value < 10 for value in result["stochastic_values"]))
-
-    def test_all_signal_types_share_the_same_entry_exception_decision(self):
-        history = [candle(index, 121 - index, low=120 - index, high=122 - index) for index in range(20)]
-        history.append(candle(20, 100, low=100, high=110))
-        decisions = [MarketDataService._entry_sma_result(history, "CALL") for _ in ("TYPE_1", "TYPE_2", "TYPE_3")]
-        self.assertEqual({decision["result"] for decision in decisions}, {"PASS"})
-        self.assertEqual({decision["entry_filter"] for decision in decisions}, {"stochastic_exception"})
+    def test_stochastic_is_not_an_entry_authorization(self):
+        self.assertTrue(stochastic_entry_exception(
+            [candle(index, 100, low=80, high=100) for index in range(13)] +
+            [candle(13, 99, low=80, high=100)], "PUT")["allowed"])
 
 
 class StochasticExitTests(unittest.TestCase):

@@ -11,6 +11,7 @@ services:
       DATABASE_PATH: /app/data/production.sqlite3
     ports:
       - "8765:8765"
+      - "8766:8766"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

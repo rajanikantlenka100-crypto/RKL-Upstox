@@ -45,6 +45,14 @@ WEBSOCKET_MODE = os.getenv("WEBSOCKET_MODE", "full").strip().lower()
 INSTRUMENT_MASTER_URL = os.getenv("INSTRUMENT_MASTER_URL", "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz").strip()
 INSTRUMENT_MASTER_PATH = Path(os.getenv("INSTRUMENT_MASTER_PATH", str(ROOT / "instrument_master.json")))
 _DATABASE_OVERRIDE = os.getenv("DATABASE_PATH", "").strip()
+PRODUCTION_DATABASE_PATH = Path(os.getenv(
+    "PRODUCTION_DATABASE_PATH",
+    str(ROOT / "data" / "production.sqlite3")
+))
+SANDBOX_DATABASE_PATH = Path(os.getenv(
+    "SANDBOX_DATABASE_PATH",
+    str(ROOT / "data" / "sandbox.sqlite3")
+))
 _MODE_DATABASES = {
     "READ_ONLY": ROOT / "data" / "readonly.sqlite3",
     "BACKTEST": ROOT / "data" / "backtest.sqlite3",
@@ -75,8 +83,8 @@ INDEX_EXCHANGES = {"NIFTY": "NSE_INDEX", "BANKNIFTY": "NSE_INDEX", "FINNIFTY": "
 STRIKE_INTERVALS = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25, "SENSEX": 100}
 CCI_PERIOD = int(os.getenv("CCI_PERIOD", "5"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_SMA_PERIOD = int(os.getenv("RSI_SMA_PERIOD", "5"))
-RSI_LOOKBACK_PERIODS = int(os.getenv("RSI_LOOKBACK_PERIODS", "5"))
+RSI_SMA_PERIOD = int(os.getenv("RSI_SMA_PERIOD", "14"))
+RSI_LOOKBACK_PERIODS = 1
 SL_BUFFER = float(os.getenv("SL_BUFFER", "1.0"))
 LOT_COUNT = int(os.getenv("LOT_COUNT", "1"))
 SANDBOX_INITIAL_CAPITAL = float(os.getenv("SANDBOX_INITIAL_CAPITAL", "200000"))

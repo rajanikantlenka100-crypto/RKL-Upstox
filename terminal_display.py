@@ -34,6 +34,7 @@ class TerminalDisplay:
         self.indicator_base = {}
         self.indicator_updated = {}
         self.indicator_reason = {}
+        self.rsi_sma14 = {}
         self.stochastic14 = {}
         self.last_candle_update = {}
         self.rest_status = {}
@@ -224,6 +225,10 @@ class TerminalDisplay:
             self.indicator_updated[instrument] = datetime.now(IST)
             self.indicator_reason[instrument] = reason or ("insufficient completed candles" if cci_value is None or rsi_value is None else "LIVE")
 
+    def set_rsi_sma14(self, instrument, value):
+        with self.lock:
+            self.rsi_sma14[instrument] = value
+
     def set_stochastic(self, instrument, value):
         with self.lock:
             self.stochastic14[instrument] = value
@@ -267,6 +272,7 @@ class TerminalDisplay:
                 "option_universe": dict(self.option_universe),
                 "prev2": dict(self.prev2), "previous": dict(self.previous), "indicators": dict(self.indicators),
                 "stochastic14": dict(self.stochastic14),
+                "rsi_sma14": dict(self.rsi_sma14),
                 "indicator_base": dict(self.indicator_base), "indicator_updated": dict(self.indicator_updated),
                 "indicator_reason": dict(self.indicator_reason), "last_candle_update": dict(self.last_candle_update),
                 "rest_status": dict(self.rest_status), "health": dict(self.health),

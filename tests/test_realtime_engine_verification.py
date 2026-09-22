@@ -38,12 +38,14 @@ class RealtimeEngineVerificationTests(unittest.TestCase):
 
     def test_type2_and_type3_are_running_candle_signals(self):
         prev2 = candle("NIFTY", 0, 100, 110, 95, 100)
-        previous = candle("NIFTY", 5, 98, 102, 90, 101)
-        running = candle("NIFTY", 10, 101, 104, 91, 103, "RUNNING")
+        previous = candle("NIFTY", 5, 98, 105, 90, 100)
+        running = candle("NIFTY", 10, 101, 111, 91, 103, "RUNNING")
         type2 = Type2Engine().evaluate(prev2, previous, running, 103, direction="CALL", rsi_pass=True)
         self.assertIsNotNone(type2)
         self.assertEqual(type2.signal_type, "TYPE_2")
-        type3 = Type3Engine().evaluate(prev2, previous, running, 103, direction="CALL", rsi_pass=True, sma_pass=True)
+
+        type3_previous = candle("NIFTY", 5, 96, 108, 86, 106.1)
+        type3 = Type3Engine().evaluate(prev2, type3_previous, running, 103, direction="CALL", rsi_pass=True, sma_pass=True)
         self.assertIsNotNone(type3)
         self.assertEqual(type3.signal_type, "TYPE_3")
 

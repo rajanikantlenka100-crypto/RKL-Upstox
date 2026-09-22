@@ -61,6 +61,7 @@ class IndicatorState:
     sma21: float | None = None
     rsi14: float | None = None
     rsi_sma5: float | None = None
+    rsi_sma14: float | None = None
     cci5: float | None = None
     stochastic14: float | None = None
     trend: str | None = None
@@ -89,6 +90,11 @@ class SignalState:
     timestamp: str | None = None
     option: str | None = None
     filters: dict[str, Any] = field(default_factory=dict)
+    type1_conditions: dict[str, Any] = field(default_factory=dict)
+    matched_signal_types: tuple = ()
+    signal_lock_status: str | None = None
+    rsi14: float | None = None
+    rsi14_sma14: float | None = None
     entry_filter: str | None = None
     stochastic_values: tuple = ()
     option_details: dict[str, Any] = field(default_factory=dict)
@@ -301,6 +307,7 @@ def build_indicator_state(symbol: str, snapshot: dict[str, Any]) -> IndicatorSta
         sma21=sma21,
         rsi14=rsi_value,
         rsi_sma5=rsi_sma5,
+        rsi_sma14=((_value(snapshot, "rsi_sma14") or {}).get(symbol)),
         cci5=cci_value,
         stochastic14=((_value(snapshot, "stochastic14") or {}).get(symbol)),
         trend=((_value(snapshot, "indicator_trend") or {}).get(symbol)),
@@ -324,6 +331,10 @@ def build_signal_state(snapshot: dict[str, Any]) -> SignalState:
         signal_type=signal.get("signal_type"), direction=signal.get("direction"),
         status=signal.get("status"), timestamp=signal.get("timestamp"),
         option=signal.get("option"), filters=dict(signal.get("type2_conditions") or {}),
+        type1_conditions=dict(signal.get("type1_conditions") or {}),
+        matched_signal_types=tuple(signal.get("matched_signal_types") or ()),
+        signal_lock_status=signal.get("signal_lock_status"),
+        rsi14=signal.get("rsi14"), rsi14_sma14=signal.get("rsi14_sma14"),
         entry_filter=signal.get("entry_filter"),
         stochastic_values=tuple(signal.get("stochastic_values") or ()),
         option_details=dict(signal.get("option_details") or {}),
