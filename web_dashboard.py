@@ -25,174 +25,214 @@ HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RKL Algo Control Center</title>
+  <title>RKL Upstox — Trading Terminal</title>
   <style>
-    :root { --bg: #081217; --bg-2: #101e24; --panel: rgba(17, 31, 37, 0.92); --panel-2: #0c1b20; --line: #28434b; --text: #edf7f5; --muted: #8ba6aa; --green: #57dda3; --amber: #f4c76d; --red: #ff7182; --cyan: #70dcf2; --accent: #70dcf2; --shadow: rgba(0, 0, 0, 0.28); }
-    :root[data-theme="arctic"] { --bg: #eaf1f3; --bg-2: #d5e1e5; --panel: rgba(250, 252, 252, 0.94); --panel-2: #edf4f5; --line: #b7cbd0; --text: #152a31; --muted: #5e747b; --green: #087f5b; --amber: #a46600; --red: #b42318; --cyan: #006d8f; --accent: #006d8f; --shadow: rgba(39, 67, 80, 0.16); }
-    :root[data-theme="midnight"] { --bg: #070b13; --bg-2: #121a2c; --panel: rgba(18, 27, 48, 0.94); --panel-2: #0b1221; --line: #2d4163; --text: #f5f7ff; --muted: #91a5c0; --green: #73e0ad; --amber: #f4c66d; --red: #ff7c8b; --cyan: #74d9ff; --accent: #a6b8ff; --shadow: rgba(0, 0, 0, 0.36); }
-    :root[data-theme="copper"] { --bg: #17110d; --bg-2: #2a1b13; --panel: rgba(48, 31, 23, 0.94); --panel-2: #211610; --line: #66483a; --text: #fff4e8; --muted: #c7a992; --green: #8ee0ac; --amber: #f4b66d; --red: #ff8580; --cyan: #8fd9d5; --accent: #e5a56f; --shadow: rgba(15, 7, 3, 0.35); }
-    :root[data-theme="emerald"] { --bg: #061511; --bg-2: #0e2b22; --panel: rgba(12, 43, 34, 0.94); --panel-2: #09231c; --line: #245e4d; --text: #e7fff2; --muted: #86b9a5; --green: #73efb0; --amber: #e9ca73; --red: #ff807f; --cyan: #81e4d4; --accent: #73efb0; --shadow: rgba(0, 12, 8, 0.35); }
-    :root[data-theme="paper"] { --bg: #f2eee6; --bg-2: #e4ded2; --panel: rgba(255, 253, 248, 0.96); --panel-2: #f5f0e7; --line: #d3c8b6; --text: #2c2823; --muted: #776c5d; --green: #17734e; --amber: #a96812; --red: #b63b32; --cyan: #1d7180; --accent: #9b4d2e; --shadow: rgba(78, 63, 44, 0.15); }
-    :root[data-theme="solarized"] { --bg: #002b36; --bg-2: #073642; --panel: rgba(7, 54, 66, 0.95); --panel-2: #04313c; --line: #1b5662; --text: #eee8d5; --muted: #93a1a1; --green: #859900; --amber: #b58900; --red: #dc322f; --cyan: #2aa198; --accent: #cb4b16; --shadow: rgba(0, 20, 25, 0.36); }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; max-width: 100%; overflow-x: hidden; background: radial-gradient(circle at 90% -10%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 38%), linear-gradient(145deg, var(--bg) 0%, var(--bg-2) 100%); color: var(--text); font-family: "Aptos", "Trebuchet MS", sans-serif; }
-    .shell { width: min(100%, 1480px); margin: 0 auto; padding: 20px clamp(14px, 2.4vw, 34px) 44px; }
-    .topbar { background: color-mix(in srgb, var(--bg) 88%, transparent); border-bottom: 1px solid var(--line); padding: 16px clamp(14px, 2.4vw, 34px); position: sticky; top: 0; z-index: 5; backdrop-filter: blur(18px); }
-    .topbar-inner { max-width: 1480px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; gap: 24px; }
-    .brand { font-size: 1.02rem; font-weight: 800; letter-spacing: 0.13rem; text-transform: uppercase; }
-    .toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-width: 0; }
-    select { color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font: inherit; font-size: 0.78rem; }
-    .small { color: var(--muted); font-size: 0.66rem; letter-spacing: 0.12rem; text-transform: uppercase; }
-    .chip { display: inline-flex; align-items: center; min-height: 26px; padding: 5px 9px; border-radius: 7px; border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 88%, transparent); font-size: 0.63rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05rem; white-space: nowrap; }
-    .chip.ok { color: var(--green); }
-    .chip.warn { color: var(--amber); }
-    .chip.bad { color: var(--red); }
-    .chip.info { color: var(--cyan); }
-    .layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(360px, 0.95fr); gap: 20px; margin-top: 20px; align-items: start; }
-    .stack { display: grid; gap: 20px; min-width: 0; }
-    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 14px 36px var(--shadow); padding: 18px; min-width: 0; }
-    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-    .card h2 { margin: 0; font-size: 0.73rem; letter-spacing: 0.15rem; text-transform: uppercase; color: var(--muted); }
-    .label { color: var(--muted); font-size: 0.65rem; letter-spacing: 0.08rem; text-transform: uppercase; text-align: right; }
-    .market-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-    .instrument { min-width: 0; border: 1px solid var(--line); border-top: 2px solid var(--accent); background: linear-gradient(145deg, var(--panel) 0%, var(--panel-2) 100%); border-radius: 10px; padding: 15px; }
-    .instrument h3 { margin: 0 0 12px; font-size: 0.98rem; letter-spacing: 0.08rem; text-transform: uppercase; }
-    .ltp-row { display: flex; justify-content: space-between; align-items: baseline; }
-    .ltp { font-size: clamp(1.55rem, 2.4vw, 2.45rem); font-weight: 800; letter-spacing: -0.03rem; }
-    .meta { text-align: right; color: var(--muted); font-size: 0.7rem; }
-    .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
-    .metric { border: 1px solid var(--line); border-radius: 8px; background: color-mix(in srgb, var(--panel-2) 80%, transparent); padding: 9px 10px; min-width: 0; }
-    .metric-label { display: block; color: var(--muted); font-size: 0.64rem; letter-spacing: 0.07rem; text-transform: uppercase; margin-bottom: 4px; }
-    .metric-value { font-size: 0.84rem; font-weight: 600; }
-    table { width: 100%; max-width: 100%; table-layout: fixed; border-collapse: collapse; }
-    td { padding: 8px 4px 8px 0; border-bottom: 1px solid var(--line); font-size: 0.74rem; overflow-wrap: anywhere; }
-    td:first-child { width: 120px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05rem; }
-    .data-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    .entry { border: 1px solid var(--line); border-radius: 9px; background: color-mix(in srgb, var(--panel-2) 82%, transparent); padding: 12px 13px; line-height: 1.55; min-width: 0; }
-    .signal-panel { border-left: 4px solid var(--accent); background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 9%, var(--panel)), var(--panel)); }
-    .signal-box { border: 1px solid var(--line); border-radius: 9px; background: color-mix(in srgb, var(--panel-2) 84%, transparent); padding: 13px; }
-    .events { display: grid; gap: 9px; max-height: 250px; overflow: auto; padding-right: 2px; }
-    .event-line { padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: color-mix(in srgb, var(--panel-2) 82%, transparent); font-size: 0.74rem; line-height: 1.45; }
-    .dim { color: var(--muted); }
-    .ok { color: var(--green); }
-    .warn { color: var(--amber); }
-    .bad { color: var(--red); }
-    .info { color: var(--cyan); }
-    .notice { position: fixed; right: 18px; bottom: 18px; z-index: 10; max-width: min(420px, calc(100vw - 36px)); padding: 12px 14px; border: 1px solid var(--cyan); border-radius: 10px; background: rgba(13,21,27,0.96); box-shadow: 0 12px 36px var(--shadow); opacity: 0; transform: translateY(12px); transition: opacity .18s ease, transform .18s ease; pointer-events: none; }
-    .notice.visible { opacity: 1; transform: translateY(0); }
-    .connection { display: inline-flex; align-items: center; gap: 7px; margin-left: 10px; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
-    .dot.off { background: var(--red); }
-    @media (max-width: 1120px) { .topbar-inner { align-items: flex-start; flex-direction: column; } .toolbar { width: 100%; justify-content: space-between; } }
-    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } .market-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    @media (max-width: 620px) { .shell { padding-top: 14px; } .toolbar { align-items: flex-start; flex-wrap: wrap; } .market-grid, .data-grid { grid-template-columns: 1fr; } .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .card { padding: 14px; } .card-head { align-items: flex-start; flex-direction: column; } .label { text-align: left; } }
+    :root {
+      --bg:#090c10; --panel:#11161c; --panel2:#0d1217; --line:#252c34;
+      --text:#e8edf2; --muted:#7f8995; --green:#35d07f; --red:#ff5f6d;
+      --amber:#e8b84a; --cyan:#54b9d6; --blue:#6f9cff; --shadow:rgba(0,0,0,.28);
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);
+      font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;font-size:14px}
+    body{overflow-x:hidden}
+    .topbar{position:sticky;top:0;z-index:20;background:#0b0f14;
+      border-bottom:1px solid var(--line)}
+    .topbar-inner{max-width:1600px;margin:auto;padding:12px 20px;
+      display:flex;align-items:center;justify-content:space-between;gap:16px}
+    .brand{font-size:17px;font-weight:750;letter-spacing:.02em}
+    .subbrand{margin-top:3px;color:var(--muted);font-size:11px}
+    .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    .small{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+    .chip{display:inline-flex;align-items:center;min-height:24px;padding:4px 8px;
+      border:1px solid var(--line);border-radius:5px;background:#121820;
+      font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+    .chip.ok,.ok{color:var(--green)} .chip.warn,.warn{color:var(--amber)}
+    .chip.bad,.bad{color:var(--red)} .chip.info,.info{color:var(--cyan)}
+    .connection{display:inline-flex;align-items:center;gap:6px}
+    .dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
+    .dot.off{background:var(--red)}
+    #themeSelect{display:none}
+
+    .shell{max-width:1600px;margin:auto;padding:14px 20px 30px}
+    .status-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}
+    .status-box{background:var(--panel);border:1px solid var(--line);padding:10px 12px}
+    .status-box .value{margin-top:4px;font-weight:700}
+    .layout{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(340px,.72fr);
+      gap:10px;align-items:start}
+    .stack{display:grid;gap:10px;min-width:0}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+      padding:13px;min-width:0;box-shadow:0 8px 24px var(--shadow)}
+    .card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;
+      margin-bottom:10px}
+    .card h2{margin:0;font-size:11px;font-weight:750;letter-spacing:.09em;
+      text-transform:uppercase;color:#aeb7c1}
+    .label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+    .market-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+    .instrument{background:var(--panel2);border:1px solid var(--line);padding:12px;
+      min-width:0}
+    .instrument h3{margin:0 0 8px;font-size:12px;letter-spacing:.04em}
+    .ltp-row{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+    .ltp{font-size:25px;font-weight:750;letter-spacing:-.03em}
+    .meta{text-align:right;color:var(--muted);font-size:10px;line-height:1.5}
+    .metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:9px}
+    .metric{background:#0d1319;border:1px solid var(--line);padding:7px 8px;min-width:0}
+    .metric-label{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;
+      letter-spacing:.05em;margin-bottom:3px}
+    .metric-value{font-size:11px;font-weight:650;overflow-wrap:anywhere}
+    table{width:100%;border-collapse:collapse;table-layout:fixed}
+    td{padding:6px 3px;border-bottom:1px solid #20262d;font-size:10px;overflow-wrap:anywhere}
+    td:first-child{width:92px;color:var(--muted);text-transform:uppercase;font-size:9px}
+    .data-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+    .entry{background:var(--panel2);border:1px solid var(--line);padding:9px;
+      line-height:1.55;min-width:0;font-size:11px}
+    .entry strong{font-size:11px}
+    .signal-panel{border-color:#34404b}
+    .signal-box{background:var(--panel2);border:1px solid var(--line);padding:10px}
+    .events{display:grid;gap:6px;max-height:260px;overflow:auto}
+    .event-line{background:var(--panel2);border:1px solid var(--line);padding:8px;
+      font-size:10px;line-height:1.45}
+    .terminal-title{display:flex;align-items:center;gap:8px}
+    .decision{font-size:22px;font-weight:800;letter-spacing:.03em}
+    .decision.call{color:var(--green)} .decision.put{color:var(--red)}
+    .section-kicker{font-size:9px;color:#66717d;text-transform:uppercase;letter-spacing:.13em;
+      margin:2px 0 -3px}
+    #candleChart{display:block;width:100%;height:280px;background:#0b1015;border:1px solid var(--line)}
+    .notice{position:fixed;right:14px;bottom:14px;z-index:30;max-width:420px;
+      padding:10px 12px;border:1px solid var(--cyan);border-radius:5px;
+      background:#10161d;box-shadow:0 10px 28px #0008;opacity:0;
+      transform:translateY(8px);transition:.18s;pointer-events:none;font-size:11px}
+    .notice.visible{opacity:1;transform:translateY(0)}
+    .full{grid-column:1/-1}
+    @media(max-width:1180px){
+      .market-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .layout{grid-template-columns:1fr}
+    }
+    @media(max-width:700px){
+      .shell{padding:10px}
+      .topbar-inner{padding:10px}
+      .status-strip{grid-template-columns:repeat(2,1fr)}
+      .market-grid,.data-grid{grid-template-columns:1fr}
+      .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .toolbar{justify-content:flex-start}
+      .ltp{font-size:23px}
+    }
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div>
-        <div class="brand">RKL Algo Trading Control Center</div>
-        <div class="small">Read-only market intelligence</div>
-      </div>
-      <div class="toolbar"><select id="themeSelect" aria-label="Dashboard theme"><option value="obsidian">Obsidian Pro</option><option value="arctic">Arctic Institutional</option><option value="midnight">Midnight Quant</option><option value="copper">Copper Terminal</option><option value="emerald">Emerald Ledger</option><option value="paper">Paper Research</option><option value="solarized">Solarized Focus</option></select><div id="headerBadges"><span class="connection"><span class="dot" id="connectionDot"></span><span class="small" id="connectionText">CONNECTING</span></span></div></div>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div>
+      <div class="brand">RKL Upstox <span style="color:#66717d">/</span> Trading Terminal</div>
+      <div class="subbrand">Read-only observer · index decision engine · option execution state</div>
     </div>
-  </header>
+    <div class="toolbar">
+      <div id="headerBadges"></div>
+      <span class="connection"><span class="dot" id="connectionDot"></span><span class="small" id="connectionText">CONNECTING</span></span>
+      <select id="themeSelect" aria-label="Dashboard theme"><option value="obsidian">Terminal</option></select>
+    </div>
+  </div>
+</header>
 
-  <main class="shell">
-    <div class="card">
-      <div class="card-head">
-        <h2>Market status</h2>
-        <span class="label" id="marketStatus">UNKNOWN</span>
-      </div>
-      <div class="data-grid" id="marketStatusGrid"></div>
+<main class="shell">
+  <div class="status-strip">
+    <div class="status-box"><div class="small">Market</div><div class="value" id="marketStatus">UNKNOWN</div></div>
+    <div class="status-box"><div class="small">Pipeline</div><div class="value" id="pipelineStateLabel">UNAVAILABLE</div></div>
+    <div class="status-box"><div class="small">Signal</div><div class="value" id="signalState">WAITING</div></div>
+    <div class="status-box"><div class="small">Execution</div><div class="value" id="approvalState">GUARDED</div></div>
+  </div>
+
+  <div class="card" style="margin-bottom:10px">
+    <div class="card-head"><h2>Market overview</h2><span class="label">Live observer state</span></div>
+    <div class="market-grid" id="marketGrid"></div>
+  </div>
+
+  <div class="layout">
+    <div class="stack">
+      <section class="card">
+        <div class="card-head"><h2>5-minute market view</h2><span class="label">Authoritative candle state</span></div>
+        <canvas id="candleChart" height="280" aria-label="Five minute candle chart"></canvas>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Indicators & data quality</h2><span class="label" id="qualityStatus">READY</span></div>
+        <div id="indicatorGrid" class="data-grid"></div>
+        <div style="height:8px"></div>
+        <div id="qualityGrid" class="data-grid"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Signal history</h2><span class="label">Candidate / lifecycle record</span></div>
+        <div id="signalHistoryPanel" class="events"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Execution timeline</h2><span class="label">Observer events</span></div>
+        <div id="eventsPanel" class="events"></div>
+      </section>
     </div>
 
-    <div class="card">
-      <div class="card-head">
-        <h2>Pipeline state</h2>
-        <span class="label" id="pipelineStateLabel">UNAVAILABLE</span>
-      </div>
-      <div class="data-grid" id="pipelineGrid"></div>
+    <div class="stack">
+      <section class="card signal-panel">
+        <div class="card-head"><h2>Decision rail</h2><span class="label">Current signal</span></div>
+        <div id="signalPanel" class="signal-box"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Option execution</h2><span class="label">Selected contract / universe</span></div>
+        <div id="optionPanel" class="signal-box"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Position & Exit monitor</h2><span class="label" id="positionsState">NONE</span></div>
+        <div id="positionsPanel" class="signal-box"></div>
+        <div style="height:7px"></div>
+        <div id="exitsPanel" class="signal-box"></div>
+        <div id="exitsState" class="label" style="margin-top:6px">UNAVAILABLE</div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Orders & fills</h2><span class="label" id="ordersState">NONE</span></div>
+        <div id="ordersPanel" class="signal-box"></div>
+        <div style="height:7px"></div>
+        <div id="fillsPanel" class="signal-box"></div>
+        <div id="fillsState" class="label" style="margin-top:6px">UNAVAILABLE</div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Closed trades</h2><span class="label">Recent</span></div>
+        <div id="closedTradesPanel" class="events"></div>
+      </section>
     </div>
+  </div>
 
-    <div class="layout">
-      <div class="stack">
-        <div class="small">DATA WINDOW | MARKET INTELLIGENCE</div>
-        <section class="card">
-          <div class="card-head"><h2>Index market data</h2><span class="label">Authoritative runtime state</span></div>
-          <div class="market-grid" id="marketGrid"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>5-minute price window</h2><span class="label">Backend candles only</span></div>
-          <canvas id="candleChart" height="220" aria-label="Five minute candle chart"></canvas>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Data quality</h2><span class="label" id="qualityStatus">READY</span></div>
-          <div id="qualityGrid" class="data-grid"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Indicators</h2><span class="label">Backend state</span></div>
-          <div id="indicatorGrid" class="data-grid"></div>
-        </section>
-      </div>
-
-      <div class="stack">
-        <div class="small">TRADING WINDOW | SIGNALS, POSITIONS, ORDERS</div>
-        <section class="card signal-panel">
-          <div class="card-head"><h2>Signal engine</h2><span class="label" id="signalState">WAITING</span></div>
-          <div id="signalPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Signal monitor</h2><span class="label">Type 1 / Type 2 audit</span></div>
-          <div id="signalHistoryPanel" class="events"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Automatic entry</h2><span class="label" id="approvalState">GUARDED</span></div>
-          <div id="approvalPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>ATM OPTION EXECUTION</h2><span class="label">Authoritative backend</span></div>
-          <div id="optionPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Positions</h2><span class="label" id="positionsState">NONE</span></div>
-          <div id="positionsPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Closed trades</h2><span class="label">Recent backend records</span></div>
-          <div id="closedTradesPanel" class="events"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Orders</h2><span class="label" id="ordersState">NONE</span></div>
-          <div id="ordersPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Fills</h2><span class="label" id="fillsState">UNAVAILABLE</span></div>
-          <div id="fillsPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Exit monitor</h2><span class="label" id="exitsState">UNAVAILABLE</span></div>
-          <div id="exitsPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Incidents</h2><span class="label" id="incidentsState">UNAVAILABLE</span></div>
-          <div id="incidentsPanel" class="events"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Report</h2><span class="label" id="reportState">UNAVAILABLE</span></div>
-          <div id="reportPanel" class="signal-box"></div>
-        </section>
-        <section class="card">
-          <div class="card-head"><h2>Event stream</h2><span class="label">Recent</span></div>
-          <div id="eventsPanel" class="events"></div>
-        </section>
-      </div>
+  <div class="card" style="margin-top:10px">
+    <div class="card-head"><h2>System / pipeline diagnostics</h2><span class="label">Read-only</span></div>
+    <div class="data-grid">
+      <div id="marketStatusGrid"></div>
+      <div id="pipelineGrid"></div>
     </div>
-  </main>
-  <div id="notice" class="notice"></div>
+  </div>
 
-  <script>
+  <div class="layout" style="margin-top:10px">
+    <section class="card">
+      <div class="card-head"><h2>Automatic entry state</h2><span class="label">Guard status</span></div>
+      <div id="approvalPanel" class="signal-box"></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Incidents</h2><span class="label" id="incidentsState">UNAVAILABLE</span></div>
+      <div id="incidentsPanel" class="events"></div>
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Report</h2><span class="label" id="reportState">UNAVAILABLE</span></div>
+      <div id="reportPanel" class="signal-box"></div>
+    </section>
+  </div>
+</main>
+
+<div id="notice" class="notice"></div>
+
+<script>
     const indexNames = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"];
     function fmtNumber(value, digits = 2) {
       if (value === null || value === undefined || value === "") return "--";
